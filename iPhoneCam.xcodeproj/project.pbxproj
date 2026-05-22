@@ -16,6 +16,7 @@
 		300000000000000000000007 /* H264Encoder.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000007 /* H264Encoder.swift */; };
 		300000000000000000000008 /* BonjourBrowser.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000008 /* BonjourBrowser.swift */; };
 		300000000000000000000009 /* NetworkVideoSender.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000009 /* NetworkVideoSender.swift */; };
+		300000000000000000000022 /* LaunchScreen.storyboard in Resources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000021 /* LaunchScreen.storyboard */; };
 		300000000000000000000010 /* Packet.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000001 /* Packet.swift */; };
 		300000000000000000000011 /* FrameReassembler.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000002 /* FrameReassembler.swift */; };
 		300000000000000000000012 /* macOSReceiverApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000011 /* macOSReceiverApp.swift */; };
@@ -44,6 +45,7 @@
 		200000000000000000000008 /* BonjourBrowser.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BonjourBrowser.swift; sourceTree = "<group>"; };
 		200000000000000000000009 /* NetworkVideoSender.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NetworkVideoSender.swift; sourceTree = "<group>"; };
 		200000000000000000000010 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		200000000000000000000021 /* LaunchScreen.storyboard */ = {isa = PBXFileReference; lastKnownFileType = file.storyboard; path = LaunchScreen.storyboard; sourceTree = "<group>"; };
 		200000000000000000000011 /* macOSReceiverApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = macOSReceiverApp.swift; sourceTree = "<group>"; };
 		200000000000000000000012 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
 		200000000000000000000013 /* SampleBufferDisplayView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SampleBufferDisplayView.swift; sourceTree = "<group>"; };
@@ -122,6 +124,7 @@
 				200000000000000000000008 /* BonjourBrowser.swift */,
 				200000000000000000000009 /* NetworkVideoSender.swift */,
 				200000000000000000000010 /* Info.plist */,
+				200000000000000000000021 /* LaunchScreen.storyboard */,
 			);
 			path = iOSCamera;
 			sourceTree = "<group>";
@@ -250,6 +253,7 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				300000000000000000000022 /* LaunchScreen.storyboard in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

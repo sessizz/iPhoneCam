@@ -9,7 +9,8 @@ struct CameraPreview: UIViewRepresentable {
     func makeUIView(context: Context) -> PreviewView {
         let view = PreviewView()
         view.previewLayer.session = session
-        view.previewLayer.videoGravity = .resizeAspectFill
+        view.previewLayer.videoGravity = .resizeAspect
+        view.previewLayer.backgroundColor = UIColor.black.cgColor
         view.apply(rotationAngle: rotationAngle)
         return view
     }
