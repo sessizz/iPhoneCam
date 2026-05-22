@@ -4,27 +4,20 @@ import UIKit
 
 struct ContentView: View {
     @StateObject private var model = CameraViewModel()
+    @State private var isInfoExpanded = true
 
     var body: some View {
         GeometryReader { proxy in
             let compact = proxy.size.height < 430
             ZStack {
+                Color.black
+                    .ignoresSafeArea()
+
                 CameraPreview(session: model.capture.session, rotationAngle: model.capture.videoRotationAngle)
                     .ignoresSafeArea()
 
-                HStack(alignment: .top, spacing: 16) {
-                    zoomSidePanel(compact: compact)
-
-                    VStack(alignment: .leading, spacing: 12) {
-                        statusPanel
-                        Spacer()
-                        bottomPanel
-                    }
-                    .frame(maxWidth: compact ? 560 : 680, alignment: .leading)
-
-                    Spacer(minLength: 0)
-                }
-                .padding(compact ? 10 : 16)
+                controlOverlay(compact: compact)
+                    .ignoresSafeArea()
             }
         }
         .task {
@@ -38,76 +31,95 @@ struct ContentView: View {
         }
     }
 
-    private var statusPanel: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack(spacing: 10) {
-                Text("iPhoneCam")
-                    .font(.headline)
+    private func controlOverlay(compact: Bool) -> some View {
+        ZStack {
+            zoomSidePanel(compact: compact)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+                .padding(.leading, compact ? 10 : 16)
+                .padding(.vertical, compact ? 10 : 16)
+
+            infoPanel
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+                .padding(.top, compact ? 10 : 18)
+
+            bottomZoomBar
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
+                .padding(.bottom, compact ? 12 : 20)
+        }
+    }
+
+    private var infoPanel: some View {
+        VStack(alignment: .leading, spacing: isInfoExpanded ? 8 : 0) {
+            HStack(alignment: .center, spacing: 12) {
+                Button {
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        isInfoExpanded.toggle()
+                    }
+                } label: {
+                    Text("iPhoneCam")
+                        .font(.title3.weight(.semibold))
+                        .lineLimit(1)
+                }
+                .buttonStyle(.plain)
+
+                Spacer(minLength: 8)
+
                 Button {
                     model.reconnect()
                 } label: {
                     Image(systemName: "arrow.clockwise")
                         .font(.headline)
-                        .frame(width: 34, height: 30)
+                        .frame(width: 42, height: 38)
                 }
                 .buttonStyle(GlassIconButtonStyle())
                 .accessibilityLabel("Reconnect")
             }
-            Text(model.networkStatus)
-            Text(model.capture.statusText)
-            if let warning = model.capture.warningText {
-                Text(warning)
-                    .foregroundStyle(.yellow)
-            }
-        }
-        .font(.subheadline)
-        .padding(12)
-        .background(.black.opacity(0.62), in: RoundedRectangle(cornerRadius: 8))
-        .foregroundStyle(.white)
-    }
 
-    private var bottomPanel: some View {
-        ViewThatFits(in: .horizontal) {
-            HStack(alignment: .center, spacing: 12) {
-                streamInfo
-                Spacer()
-                zoomPresetButtons
-                rampDurationControl
-            }
-
-            VStack(alignment: .leading, spacing: 8) {
-                streamInfo
-                HStack(spacing: 12) {
-                    zoomPresetButtons
-                    rampDurationControl
+            if isInfoExpanded {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(model.networkStatus)
+                    Text(model.capture.statusText)
+                    if let warning = model.capture.warningText {
+                        Text(warning)
+                            .foregroundStyle(.yellow)
+                    }
+                    Divider()
+                        .overlay(.white.opacity(0.18))
+                    Text(model.capture.activeFormatText)
+                    Text(model.capture.cameraModeText)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.65)
+                    Text(model.senderStats)
                 }
+                .transition(.opacity.combined(with: .move(edge: .top)))
             }
         }
-        .font(.footnote.monospacedDigit())
-        .padding(12)
+        .font(.subheadline.monospacedDigit())
+        .padding(14)
+        .frame(width: 500, alignment: .leading)
         .background(.black.opacity(0.62), in: RoundedRectangle(cornerRadius: 8))
         .foregroundStyle(.white)
     }
 
-    private var streamInfo: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text(model.capture.activeFormatText)
-            Text(model.capture.cameraModeText)
-                .lineLimit(1)
-                .minimumScaleFactor(0.65)
-            Text(model.senderStats)
+    private var bottomZoomBar: some View {
+        HStack(spacing: 12) {
+            zoomPresetButtons
+            rampDurationControl
         }
-        .frame(maxWidth: 280, alignment: .leading)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .background(.black.opacity(0.62), in: RoundedRectangle(cornerRadius: 8))
+        .foregroundStyle(.white)
     }
 
     private var zoomPresetButtons: some View {
-        HStack(spacing: 6) {
+        HStack(spacing: 8) {
             ForEach(model.zoomPresets, id: \.self) { factor in
                 Button {
                     model.zoom(to: factor)
                 } label: {
                     Text(model.zoomLabel(for: factor))
-                        .frame(width: 44, height: 30)
+                        .frame(width: 66, height: 44)
                 }
                 .buttonStyle(ZoomPresetButtonStyle())
                 .disabled(!model.isZoomPresetAvailable(factor))
@@ -119,13 +131,15 @@ struct ContentView: View {
     private var rampDurationControl: some View {
         HStack(spacing: 8) {
             Image(systemName: "timer")
-                .frame(width: 18)
+                .font(.title3.weight(.semibold))
+                .frame(width: 28)
             Slider(value: $model.presetRampDuration, in: 0.3...3.0, step: 0.1)
-                .frame(width: 112)
+                .frame(width: 132)
             Text(String(format: "%.1fs", model.presetRampDuration))
-                .frame(width: 40, alignment: .trailing)
+                .font(.subheadline.monospacedDigit().weight(.semibold))
+                .frame(width: 44, alignment: .trailing)
         }
-        .frame(width: 190)
+        .frame(width: 220)
     }
 
     private func zoomSidePanel(compact: Bool) -> some View {
@@ -145,7 +159,7 @@ struct ContentView: View {
             .frame(width: 74, height: compact ? 158 : 224)
         }
         .padding(10)
-        .background(.black.opacity(0.62), in: RoundedRectangle(cornerRadius: 8))
+        .background(.black.opacity(0.46), in: RoundedRectangle(cornerRadius: 8))
         .foregroundStyle(.white)
     }
 }
