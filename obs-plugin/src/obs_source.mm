@@ -14,6 +14,19 @@ constexpr const char *kSettingReceiverName = "receiver_name";
 constexpr const char *kSettingLatency = "latency_ms";
 constexpr uint64_t kOneSecondNanos = 1000000000ULL;
 
+const char *packetKindName(PacketKind kind)
+{
+    switch (kind) {
+    case PacketKind::Hello:
+        return "hello";
+    case PacketKind::Format:
+        return "format";
+    case PacketKind::FrameFragment:
+        return "frame";
+    }
+    return "unknown";
+}
+
 std::string formatStats(const SourceStats &stats)
 {
     char buffer[768];
@@ -137,17 +150,38 @@ void IPhoneCamSource::stopReceiver()
 void IPhoneCamSource::handleDatagram(const std::vector<uint8_t> &data)
 {
     auto packet = parsePacket(data.data(), data.size());
-    if (!packet)
+    if (!packet) {
+        if (invalidDatagramLogs_ < 10) {
+            blog(LOG_WARNING, "[iPhoneCam] Dropped invalid UDP datagram (%zu bytes)", data.size());
+            invalidDatagramLogs_ += 1;
+        }
         return;
+    }
+
+    if (frameLogs_ < 5 || packet->kind != PacketKind::FrameFragment) {
+        blog(LOG_INFO, "[iPhoneCam] Packet kind=%s frame=%llu fragment=%u/%u payload=%zu flags=%u",
+             packetKindName(packet->kind), static_cast<unsigned long long>(packet->frameId), packet->packetIndex + 1,
+             packet->packetCount, packet->payload.size(), packet->flags);
+        if (packet->kind == PacketKind::FrameFragment)
+            frameLogs_ += 1;
+    }
 
     switch (packet->kind) {
     case PacketKind::Hello:
-        if (auto hello = parseHelloPayload(packet->payload))
+        if (auto hello = parseHelloPayload(packet->payload)) {
             handleHello(*hello);
+        } else if (helloLogs_ < 5) {
+            blog(LOG_WARNING, "[iPhoneCam] Failed to parse hello payload (%zu bytes)", packet->payload.size());
+            helloLogs_ += 1;
+        }
         break;
     case PacketKind::Format:
-        if (auto format = parseFormatPayload(packet->payload))
+        if (auto format = parseFormatPayload(packet->payload)) {
             handleFormat(*format);
+        } else if (formatLogs_ < 5) {
+            blog(LOG_WARNING, "[iPhoneCam] Failed to parse format payload (%zu bytes)", packet->payload.size());
+            formatLogs_ += 1;
+        }
         break;
     case PacketKind::FrameFragment: {
         auto frame = reassembler_.accept(*packet, std::chrono::steady_clock::now());
@@ -164,6 +198,8 @@ void IPhoneCamSource::handleDatagram(const std::vector<uint8_t> &data)
 
 void IPhoneCamSource::handleHello(const HelloPayload &hello)
 {
+    blog(LOG_INFO, "[iPhoneCam] Hello from '%s': %dx%d @ %d FPS, %d bps", hello.deviceName.c_str(), hello.width,
+         hello.height, hello.fps, hello.bitrate);
     std::lock_guard<std::mutex> lock(mutex_);
     stats_.status = "Connected: " + hello.deviceName;
     stats_.deviceName = hello.deviceName;
@@ -173,8 +209,11 @@ void IPhoneCamSource::handleHello(const HelloPayload &hello)
 
 void IPhoneCamSource::handleFormat(const FormatPayload &format)
 {
+    blog(LOG_INFO, "[iPhoneCam] Format received: %dx%d @ %d FPS, sps=%zu pps=%zu", format.width, format.height,
+         format.fps, format.sps.size(), format.pps.size());
     std::string error;
     if (!decoder_->configure(format, error)) {
+        blog(LOG_ERROR, "[iPhoneCam] Decoder configure failed: %s", error.c_str());
         std::lock_guard<std::mutex> lock(mutex_);
         stats_.status = "Format error: " + error;
         stats_.waitingForKeyFrame = true;
@@ -206,6 +245,11 @@ void IPhoneCamSource::handleFrame(const EncodedVideoFrame &frame)
     DecodedFrame decoded;
     std::string error;
     if (!decoder_->decode(frame, decoded, error)) {
+        if (decodeErrorLogs_ < 10) {
+            blog(LOG_WARNING, "[iPhoneCam] Decode dropped frame %llu: %s",
+                 static_cast<unsigned long long>(frame.frameId), error.c_str());
+            decodeErrorLogs_ += 1;
+        }
         std::lock_guard<std::mutex> lock(mutex_);
         stats_.decodeDroppedFrames += 1;
         stats_.status = "Decode error: " + error;

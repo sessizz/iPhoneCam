@@ -71,6 +71,11 @@ private:
     std::chrono::steady_clock::time_point lastStatsAt_;
     int receivedFramesSinceStats_ = 0;
     int displayedFramesSinceStats_ = 0;
+    int invalidDatagramLogs_ = 0;
+    int helloLogs_ = 0;
+    int formatLogs_ = 0;
+    int frameLogs_ = 0;
+    int decodeErrorLogs_ = 0;
     uint32_t width_ = 1920;
     uint32_t height_ = 1080;
     bool noSignalOutput_ = false;
