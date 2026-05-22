@@ -11,6 +11,8 @@
 #include <mutex>
 #include <string>
 
+#include <dispatch/dispatch.h>
+
 struct obs_data;
 struct obs_source;
 typedef struct obs_data obs_data_t;
@@ -56,9 +58,13 @@ private:
     void handleHello(const HelloPayload &hello);
     void handleFormat(const FormatPayload &format);
     void handleFrame(const EncodedVideoFrame &frame);
+    void decodeFrame(const EncodedVideoFrame &frame);
+    void resetDecoder();
     void outputDecodedFrame(const DecodedFrame &frame);
     void outputBlackFrame();
     void updateFpsCounters();
+    void applyLatencyMode();
+    void markStatsDirty();
 
     obs_source_t *source_ = nullptr;
     SourceSettings settings_;
@@ -66,9 +72,12 @@ private:
     SourceStats stats_;
     std::unique_ptr<NetworkReceiver> receiver_;
     std::unique_ptr<VideoDecoder> decoder_;
+    dispatch_queue_t decodeQueue_ = dispatch_queue_create("iphonecam.obs.decode", DISPATCH_QUEUE_SERIAL);
     FrameReassembler reassembler_;
     std::chrono::steady_clock::time_point lastFrameAt_;
     std::chrono::steady_clock::time_point lastStatsAt_;
+    std::atomic<bool> statsDirty_ = true;
+    std::atomic<int> pendingDecodeFrames_ = 0;
     int receivedFramesSinceStats_ = 0;
     int displayedFramesSinceStats_ = 0;
     int invalidDatagramLogs_ = 0;

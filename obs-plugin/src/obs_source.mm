@@ -68,16 +68,18 @@ IPhoneCamSource::IPhoneCamSource(obs_data_t *settings, obs_source_t *source)
       settings_(readSettings(settings)),
       receiver_(std::make_unique<NetworkReceiver>()),
       decoder_(std::make_unique<VideoDecoder>()),
-      reassembler_(std::chrono::milliseconds(300)),
+      reassembler_(std::chrono::milliseconds(120)),
       lastFrameAt_(std::chrono::steady_clock::now()),
       lastStatsAt_(std::chrono::steady_clock::now())
 {
-    obs_source_set_async_decoupled(source_, true);
-    obs_source_set_async_unbuffered(source_, true);
+    applyLatencyMode();
     receiver_->setStatusCallback([this](const std::string &status, uint16_t port) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        stats_.status = status;
-        stats_.udpPort = port == 0 ? "-" : std::to_string(port);
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            stats_.status = status;
+            stats_.udpPort = port == 0 ? "-" : std::to_string(port);
+        }
+        markStatsDirty();
     });
     receiver_->setPacketCallback([this](const std::vector<uint8_t> &data) { handleDatagram(data); });
     startReceiver();
@@ -86,6 +88,10 @@ IPhoneCamSource::IPhoneCamSource(obs_data_t *settings, obs_source_t *source)
 IPhoneCamSource::~IPhoneCamSource()
 {
     stopReceiver();
+    dispatch_sync(decodeQueue_, ^{
+      decoder_->reset();
+      pendingDecodeFrames_ = 0;
+    });
     obs_source_output_video(source_, nullptr);
 }
 
@@ -93,7 +99,10 @@ void IPhoneCamSource::update(obs_data_t *settings)
 {
     const auto next = readSettings(settings);
     const bool restartNeeded = next.receiverName != settings_.receiverName;
+    const bool latencyChanged = next.latencyMs != settings_.latencyMs;
     settings_ = next;
+    if (latencyChanged)
+        applyLatencyMode();
     if (restartNeeded)
         restart();
 }
@@ -108,7 +117,8 @@ void IPhoneCamSource::restart()
         reassembler_.reset();
         noSignalOutput_ = false;
     }
-    decoder_->reset();
+    markStatsDirty();
+    resetDecoder();
     startReceiver();
 }
 
@@ -120,6 +130,8 @@ void IPhoneCamSource::videoTick(float)
         outputBlackFrame();
         noSignalOutput_ = true;
     }
+    if (statsDirty_.exchange(false))
+        obs_source_update_properties(source_);
 }
 
 uint32_t IPhoneCamSource::width() const
@@ -214,35 +226,45 @@ void IPhoneCamSource::handleHello(const HelloPayload &hello)
 {
     blog(LOG_INFO, "[iPhoneCam] Hello from '%s': %dx%d @ %d FPS, %d bps", hello.deviceName.c_str(), hello.width,
          hello.height, hello.fps, hello.bitrate);
-    std::lock_guard<std::mutex> lock(mutex_);
-    stats_.status = "Connected: " + hello.deviceName;
-    stats_.deviceName = hello.deviceName;
-    stats_.format = std::to_string(hello.width) + "x" + std::to_string(hello.height) + " @ " +
-                    std::to_string(hello.fps) + " FPS, " + std::to_string(hello.bitrate / 1000000) + " Mbps";
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        stats_.status = "Connected: " + hello.deviceName;
+        stats_.deviceName = hello.deviceName;
+        stats_.format = std::to_string(hello.width) + "x" + std::to_string(hello.height) + " @ " +
+                        std::to_string(hello.fps) + " FPS, " + std::to_string(hello.bitrate / 1000000) + " Mbps";
+    }
+    markStatsDirty();
 }
 
 void IPhoneCamSource::handleFormat(const FormatPayload &format)
 {
     blog(LOG_INFO, "[iPhoneCam] Format received: %dx%d @ %d FPS, sps=%zu pps=%zu", format.width, format.height,
          format.fps, format.sps.size(), format.pps.size());
-    std::string error;
-    if (!decoder_->configure(format, error)) {
-        blog(LOG_ERROR, "[iPhoneCam] Decoder configure failed: %s", error.c_str());
-        std::lock_guard<std::mutex> lock(mutex_);
-        stats_.status = "Format error: " + error;
-        stats_.waitingForKeyFrame = true;
-        return;
-    }
-
     width_ = uint32_t(format.width);
     height_ = uint32_t(format.height);
     reassembler_.reset();
 
-    std::lock_guard<std::mutex> lock(mutex_);
-    stats_.format = std::to_string(format.width) + "x" + std::to_string(format.height) + " @ " +
-                    std::to_string(format.fps) + " FPS, " + std::to_string(format.bitrate / 1000000) + " Mbps";
-    stats_.waitingForKeyFrame = true;
-    stats_.networkDroppedFrames = 0;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        stats_.format = std::to_string(format.width) + "x" + std::to_string(format.height) + " @ " +
+                        std::to_string(format.fps) + " FPS, " + std::to_string(format.bitrate / 1000000) + " Mbps";
+        stats_.waitingForKeyFrame = true;
+        stats_.networkDroppedFrames = 0;
+    }
+    markStatsDirty();
+
+    dispatch_async(decodeQueue_, ^{
+      std::string error;
+      if (!decoder_->configure(format, error)) {
+          blog(LOG_ERROR, "[iPhoneCam] Decoder configure failed: %s", error.c_str());
+          {
+              std::lock_guard<std::mutex> lock(mutex_);
+              stats_.status = "Format error: " + error;
+              stats_.waitingForKeyFrame = true;
+          }
+          markStatsDirty();
+      }
+    });
 }
 
 void IPhoneCamSource::handleFrame(const EncodedVideoFrame &frame)
@@ -262,6 +284,15 @@ void IPhoneCamSource::handleFrame(const EncodedVideoFrame &frame)
         receivedFramesSinceStats_ += 1;
     }
 
+    pendingDecodeFrames_ += 1;
+    dispatch_async(decodeQueue_, ^{
+      decodeFrame(frame);
+      pendingDecodeFrames_ -= 1;
+    });
+}
+
+void IPhoneCamSource::decodeFrame(const EncodedVideoFrame &frame)
+{
     DecodedFrame decoded;
     std::string error;
     if (decodeAttemptLogs_ < 10) {
@@ -275,10 +306,13 @@ void IPhoneCamSource::handleFrame(const EncodedVideoFrame &frame)
                  static_cast<unsigned long long>(frame.frameId), error.c_str());
             decodeErrorLogs_ += 1;
         }
-        std::lock_guard<std::mutex> lock(mutex_);
-        stats_.decodeDroppedFrames += 1;
-        stats_.status = "Decode error: " + error;
-        stats_.waitingForKeyFrame = true;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            stats_.decodeDroppedFrames += 1;
+            stats_.status = "Decode error: " + error;
+            stats_.waitingForKeyFrame = true;
+        }
+        markStatsDirty();
         return;
     }
 
@@ -286,9 +320,19 @@ void IPhoneCamSource::handleFrame(const EncodedVideoFrame &frame)
     lastFrameAt_ = std::chrono::steady_clock::now();
     noSignalOutput_ = false;
 
-    std::lock_guard<std::mutex> lock(mutex_);
-    stats_.displayedFrames += 1;
-    displayedFramesSinceStats_ += 1;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        stats_.displayedFrames += 1;
+        displayedFramesSinceStats_ += 1;
+    }
+}
+
+void IPhoneCamSource::resetDecoder()
+{
+    dispatch_sync(decodeQueue_, ^{
+      decoder_->reset();
+      pendingDecodeFrames_ = 0;
+    });
 }
 
 void IPhoneCamSource::outputDecodedFrame(const DecodedFrame &frame)
@@ -355,6 +399,18 @@ void IPhoneCamSource::updateFpsCounters()
     receivedFramesSinceStats_ = 0;
     displayedFramesSinceStats_ = 0;
     lastStatsAt_ = now;
+    markStatsDirty();
+}
+
+void IPhoneCamSource::applyLatencyMode()
+{
+    obs_source_set_async_decoupled(source_, true);
+    obs_source_set_async_unbuffered(source_, settings_.latencyMs == 0);
+}
+
+void IPhoneCamSource::markStatsDirty()
+{
+    statsDirty_ = true;
 }
 
 } // namespace iphonecam
