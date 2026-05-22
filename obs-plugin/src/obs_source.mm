@@ -1,5 +1,7 @@
 #include "obs_source.hpp"
 
+#import <CoreVideo/CoreVideo.h>
+
 #include <obs-module.h>
 #include <util/platform.h>
 
@@ -115,6 +117,7 @@ void IPhoneCamSource::restart()
         stats_ = SourceStats{};
         stats_.status = "Restarting receiver";
         reassembler_.reset();
+        lastFormat_.reset();
         noSignalOutput_ = false;
     }
     markStatsDirty();
@@ -238,12 +241,15 @@ void IPhoneCamSource::handleFormat(const FormatPayload &format)
 {
     blog(LOG_INFO, "[iPhoneCam] Format received: %dx%d @ %d FPS, sps=%zu pps=%zu", format.width, format.height,
          format.fps, format.sps.size(), format.pps.size());
+    decodeGeneration_.fetch_add(1);
+    droppingUntilKeyFrame_ = false;
     width_ = uint32_t(format.width);
     height_ = uint32_t(format.height);
     reassembler_.reset();
 
     {
         std::lock_guard<std::mutex> lock(mutex_);
+        lastFormat_ = format;
         stats_.format = std::to_string(format.width) + "x" + std::to_string(format.height) + " @ " +
                         std::to_string(format.fps) + " FPS, " + std::to_string(format.bitrate / 1000000) + " Mbps";
         stats_.waitingForKeyFrame = true;
@@ -268,6 +274,14 @@ void IPhoneCamSource::handleFormat(const FormatPayload &format)
 
 void IPhoneCamSource::handleFrame(const EncodedVideoFrame &frame)
 {
+    if (!droppingUntilKeyFrame_.load() && pendingDecodeFrames_.load() > maxPendingDecodeFrames())
+        beginLatencyCatchUp();
+
+    if (droppingUntilKeyFrame_.load()) {
+        if (!frame.isKeyFrame)
+            return;
+    }
+
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (stats_.waitingForKeyFrame && !frame.isKeyFrame) {
@@ -284,10 +298,12 @@ void IPhoneCamSource::handleFrame(const EncodedVideoFrame &frame)
     }
 
     auto *frameCopy = new EncodedVideoFrame(frame);
+    const uint64_t generation = decodeGeneration_.load();
     pendingDecodeFrames_ += 1;
     dispatch_async(decodeQueue_, ^{
       std::unique_ptr<EncodedVideoFrame> frameGuard(frameCopy);
-      decodeFrame(*frameGuard);
+      if (generation == decodeGeneration_.load())
+          decodeFrame(*frameGuard);
       pendingDecodeFrames_ -= 1;
     });
 }
@@ -321,6 +337,8 @@ void IPhoneCamSource::decodeFrame(const EncodedVideoFrame &frame)
     }
 
     outputDecodedFrame(decoded);
+    if (frame.isKeyFrame && droppingUntilKeyFrame_.load())
+        droppingUntilKeyFrame_ = false;
     lastFrameAt_ = std::chrono::steady_clock::now();
     noSignalOutput_ = false;
 
@@ -333,27 +351,78 @@ void IPhoneCamSource::decodeFrame(const EncodedVideoFrame &frame)
 
 void IPhoneCamSource::resetDecoder()
 {
+    decodeGeneration_.fetch_add(1);
+    droppingUntilKeyFrame_ = false;
     dispatch_sync(decodeQueue_, ^{});
     std::lock_guard<std::mutex> decoderLock(decoderMutex_);
     decoder_->reset();
     pendingDecodeFrames_ = 0;
 }
 
+void IPhoneCamSource::beginLatencyCatchUp()
+{
+    bool expected = false;
+    if (!droppingUntilKeyFrame_.compare_exchange_strong(expected, true))
+        return;
+
+    const uint64_t generation = decodeGeneration_.fetch_add(1) + 1;
+    const int pending = pendingDecodeFrames_.load();
+    if (latencyCatchUpLogs_ < 10) {
+        blog(LOG_WARNING, "[iPhoneCam] Decode queue is behind (%d pending), dropping to next keyframe", pending);
+        latencyCatchUpLogs_ += 1;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        stats_.waitingForKeyFrame = true;
+        stats_.decodeDroppedFrames += pending;
+    }
+    markStatsDirty();
+
+    dispatch_async(decodeQueue_, ^{
+      if (generation != decodeGeneration_.load())
+          return;
+
+      std::optional<FormatPayload> format;
+      {
+          std::lock_guard<std::mutex> lock(mutex_);
+          format = lastFormat_;
+      }
+
+      std::lock_guard<std::mutex> decoderLock(decoderMutex_);
+      decoder_->reset();
+      if (format) {
+          std::string error;
+          if (!decoder_->configure(*format, error)) {
+              blog(LOG_ERROR, "[iPhoneCam] Decoder reconfigure during latency catch-up failed: %s", error.c_str());
+              std::lock_guard<std::mutex> lock(mutex_);
+              stats_.status = "Format error: " + error;
+          }
+      }
+    });
+}
+
 void IPhoneCamSource::outputDecodedFrame(const DecodedFrame &frame)
 {
+    if (!frame.pixelBuffer)
+        return;
+
     if (outputFrameLogs_ < 10) {
         blog(LOG_INFO, "[iPhoneCam] Output decoded frame %dx%d yStride=%u uvStride=%u", frame.width, frame.height,
              frame.yStride, frame.uvStride);
         outputFrameLogs_ += 1;
     }
 
+    if (CVPixelBufferLockBaseAddress(frame.pixelBuffer, kCVPixelBufferLock_ReadOnly) != kCVReturnSuccess)
+        return;
+
     obs_source_frame obsFrame = {};
-    obsFrame.data[0] = const_cast<uint8_t *>(frame.yPlane.data());
-    obsFrame.data[1] = const_cast<uint8_t *>(frame.uvPlane.data());
-    obsFrame.linesize[0] = frame.yStride;
-    obsFrame.linesize[1] = frame.uvStride;
-    obsFrame.width = uint32_t(frame.width);
-    obsFrame.height = uint32_t(frame.height);
+    obsFrame.data[0] = static_cast<uint8_t *>(CVPixelBufferGetBaseAddressOfPlane(frame.pixelBuffer, 0));
+    obsFrame.data[1] = static_cast<uint8_t *>(CVPixelBufferGetBaseAddressOfPlane(frame.pixelBuffer, 1));
+    obsFrame.linesize[0] = uint32_t(CVPixelBufferGetBytesPerRowOfPlane(frame.pixelBuffer, 0));
+    obsFrame.linesize[1] = uint32_t(CVPixelBufferGetBytesPerRowOfPlane(frame.pixelBuffer, 1));
+    obsFrame.width = uint32_t(CVPixelBufferGetWidth(frame.pixelBuffer));
+    obsFrame.height = uint32_t(CVPixelBufferGetHeight(frame.pixelBuffer));
     obsFrame.timestamp = os_gettime_ns() + uint64_t(settings_.latencyMs) * 1000000ULL;
     obsFrame.format = VIDEO_FORMAT_NV12;
     obsFrame.full_range = frame.fullRange;
@@ -365,6 +434,8 @@ void IPhoneCamSource::outputDecodedFrame(const DecodedFrame &frame)
     }
     obsFrame.flip = false;
     obs_source_output_video(source_, &obsFrame);
+
+    CVPixelBufferUnlockBaseAddress(frame.pixelBuffer, kCVPixelBufferLock_ReadOnly);
 }
 
 void IPhoneCamSource::outputBlackFrame()
@@ -388,6 +459,15 @@ void IPhoneCamSource::outputBlackFrame()
     video_format_get_parameters_for_format(VIDEO_CS_709, VIDEO_RANGE_FULL, obsFrame.format, obsFrame.color_matrix,
                                            obsFrame.color_range_min, obsFrame.color_range_max);
     obs_source_output_video(source_, &obsFrame);
+}
+
+int IPhoneCamSource::maxPendingDecodeFrames() const
+{
+    if (settings_.latencyMs == 0)
+        return 12;
+    if (settings_.latencyMs == 60)
+        return 24;
+    return 36;
 }
 
 void IPhoneCamSource::updateFpsCounters()

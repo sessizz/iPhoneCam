@@ -9,6 +9,7 @@
 #include <chrono>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 
 #include <dispatch/dispatch.h>
@@ -62,6 +63,8 @@ private:
     void resetDecoder();
     void outputDecodedFrame(const DecodedFrame &frame);
     void outputBlackFrame();
+    void beginLatencyCatchUp();
+    int maxPendingDecodeFrames() const;
     void updateFpsCounters();
     void applyLatencyMode();
     void markStatsDirty();
@@ -72,6 +75,7 @@ private:
     SourceStats stats_;
     std::unique_ptr<NetworkReceiver> receiver_;
     std::unique_ptr<VideoDecoder> decoder_;
+    std::optional<FormatPayload> lastFormat_;
     std::mutex decoderMutex_;
     dispatch_queue_t decodeQueue_ = dispatch_queue_create("iphonecam.obs.decode", DISPATCH_QUEUE_SERIAL);
     FrameReassembler reassembler_;
@@ -79,6 +83,8 @@ private:
     std::chrono::steady_clock::time_point lastStatsAt_;
     std::atomic<bool> statsDirty_ = true;
     std::atomic<int> pendingDecodeFrames_ = 0;
+    std::atomic<uint64_t> decodeGeneration_ = 0;
+    std::atomic<bool> droppingUntilKeyFrame_ = false;
     int receivedFramesSinceStats_ = 0;
     int displayedFramesSinceStats_ = 0;
     int invalidDatagramLogs_ = 0;
@@ -91,6 +97,7 @@ private:
     int lastLoggedNetworkDrops_ = 0;
     int decodeAttemptLogs_ = 0;
     int outputFrameLogs_ = 0;
+    int latencyCatchUpLogs_ = 0;
     uint32_t width_ = 1920;
     uint32_t height_ = 1080;
     bool noSignalOutput_ = false;

@@ -5,50 +5,32 @@
 #import <Foundation/Foundation.h>
 #import <VideoToolbox/VideoToolbox.h>
 
-#include <algorithm>
+#include <utility>
 
 namespace iphonecam {
 namespace {
 
-bool copyPixelBuffer(CVImageBufferRef imageBuffer, DecodedFrame &decoded)
+bool retainPixelBuffer(CVImageBufferRef imageBuffer, DecodedFrame &decoded)
 {
     CVPixelBufferRef pixelBuffer = (CVPixelBufferRef)imageBuffer;
     if (CVPixelBufferGetPlaneCount(pixelBuffer) < 2)
         return false;
 
-    CVPixelBufferLockBaseAddress(pixelBuffer, kCVPixelBufferLock_ReadOnly);
-    const int width = int(CVPixelBufferGetWidth(pixelBuffer));
-    const int height = int(CVPixelBufferGetHeight(pixelBuffer));
-    const size_t srcYStride = CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 0);
-    const size_t srcUVStride = CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 1);
-    const auto *srcY = static_cast<const uint8_t *>(CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 0));
-    const auto *srcUV = static_cast<const uint8_t *>(CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 1));
-
-    decoded.width = width;
-    decoded.height = height;
-    decoded.yStride = uint32_t(width);
-    decoded.uvStride = uint32_t(width);
+    decoded.reset();
+    CFRetain(pixelBuffer);
+    decoded.pixelBuffer = pixelBuffer;
+    decoded.width = int(CVPixelBufferGetWidth(pixelBuffer));
+    decoded.height = int(CVPixelBufferGetHeight(pixelBuffer));
+    decoded.yStride = uint32_t(CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 0));
+    decoded.uvStride = uint32_t(CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 1));
     decoded.fullRange = true;
-    decoded.yPlane.assign(size_t(width) * size_t(height), 0);
-    decoded.uvPlane.assign(size_t(width) * size_t(height / 2), 0);
-
-    for (int row = 0; row < height; ++row) {
-        std::copy_n(srcY + size_t(row) * srcYStride, width,
-                    decoded.yPlane.data() + size_t(row) * decoded.yStride);
-    }
-    for (int row = 0; row < height / 2; ++row) {
-        std::copy_n(srcUV + size_t(row) * srcUVStride, width,
-                    decoded.uvPlane.data() + size_t(row) * decoded.uvStride);
-    }
-
-    CVPixelBufferUnlockBaseAddress(pixelBuffer, kCVPixelBufferLock_ReadOnly);
     return true;
 }
 
 struct DecodeRequest {
     DecodedFrame *decoded = nullptr;
     OSStatus status = noErr;
-    bool copied = false;
+    bool produced = false;
 };
 
 void decompressionCallback(void *, void *sourceFrameRefCon, OSStatus status, VTDecodeInfoFlags,
@@ -59,7 +41,7 @@ void decompressionCallback(void *, void *sourceFrameRefCon, OSStatus status, VTD
         return;
     request->status = status;
     if (status == noErr && imageBuffer && request->decoded)
-        request->copied = copyPixelBuffer(imageBuffer, *request->decoded);
+        request->produced = retainPixelBuffer(imageBuffer, *request->decoded);
 }
 
 std::string statusError(const char *context, OSStatus status)
@@ -68,6 +50,54 @@ std::string statusError(const char *context, OSStatus status)
 }
 
 } // namespace
+
+DecodedFrame::~DecodedFrame()
+{
+    reset();
+}
+
+DecodedFrame::DecodedFrame(DecodedFrame &&other) noexcept
+{
+    *this = std::move(other);
+}
+
+DecodedFrame &DecodedFrame::operator=(DecodedFrame &&other) noexcept
+{
+    if (this == &other)
+        return *this;
+
+    reset();
+    width = other.width;
+    height = other.height;
+    ptsNanos = other.ptsNanos;
+    yStride = other.yStride;
+    uvStride = other.uvStride;
+    fullRange = other.fullRange;
+    pixelBuffer = other.pixelBuffer;
+
+    other.width = 0;
+    other.height = 0;
+    other.ptsNanos = 0;
+    other.yStride = 0;
+    other.uvStride = 0;
+    other.fullRange = true;
+    other.pixelBuffer = nullptr;
+    return *this;
+}
+
+void DecodedFrame::reset()
+{
+    if (pixelBuffer) {
+        CFRelease(pixelBuffer);
+        pixelBuffer = nullptr;
+    }
+    width = 0;
+    height = 0;
+    ptsNanos = 0;
+    yStride = 0;
+    uvStride = 0;
+    fullRange = true;
+}
 
 struct VideoDecoder::Impl {
     CMVideoFormatDescriptionRef formatDescription = nullptr;
@@ -198,7 +228,7 @@ bool VideoDecoder::decode(const EncodedVideoFrame &frame, DecodedFrame &decoded,
         error = statusError("VideoToolbox decode callback", request.status);
         return false;
     }
-    if (!request.copied) {
+    if (!request.produced) {
         error = "VideoToolbox did not produce a pixel buffer";
         return false;
     }
