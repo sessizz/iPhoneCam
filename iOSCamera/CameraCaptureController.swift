@@ -222,6 +222,14 @@ final class CameraCaptureController: NSObject, ObservableObject, @unchecked Send
             connection.videoRotationAngle = currentRotationAngle
         }
         connection.isVideoMirrored = false
+        applyVideoStabilization(on: connection)
+    }
+
+    private func applyVideoStabilization(on connection: AVCaptureConnection) {
+        guard connection.isVideoStabilizationSupported else {
+            return
+        }
+        connection.preferredVideoStabilizationMode = .standard
     }
 
     private static func rotationAngle(for orientation: UIDeviceOrientation) -> CGFloat? {

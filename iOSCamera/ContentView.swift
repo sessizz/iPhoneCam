@@ -330,9 +330,9 @@ private struct ZoomJogControl: View {
                         .position(x: width / 2, y: yPosition(for: factor, height: height))
                 }
 
-                Circle()
-                    .stroke(.white.opacity(0.85), lineWidth: 2)
-                    .frame(width: 30, height: 30)
+                Capsule()
+                    .fill(.white.opacity(0.88))
+                    .frame(width: 34, height: 3)
                     .position(x: width / 2, y: yPosition(for: zoomFactor, height: height))
 
                 Circle()
