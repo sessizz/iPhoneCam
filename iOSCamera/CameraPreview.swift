@@ -65,7 +65,10 @@ final class PreviewView: UIView {
             return
         }
         connection.videoRotationAngle = pendingRotationAngle
-        connection.isVideoMirrored = false
+        if connection.isVideoMirroringSupported {
+            connection.automaticallyAdjustsVideoMirroring = false
+            connection.isVideoMirrored = false
+        }
     }
 
     private func scheduleRotationRetry() {

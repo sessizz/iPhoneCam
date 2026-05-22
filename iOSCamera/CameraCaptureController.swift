@@ -221,7 +221,10 @@ final class CameraCaptureController: NSObject, ObservableObject, @unchecked Send
         if connection.isVideoRotationAngleSupported(currentRotationAngle) {
             connection.videoRotationAngle = currentRotationAngle
         }
-        connection.isVideoMirrored = false
+        if connection.isVideoMirroringSupported {
+            connection.automaticallyAdjustsVideoMirroring = false
+            connection.isVideoMirrored = false
+        }
         applyVideoStabilization(on: connection)
     }
 
