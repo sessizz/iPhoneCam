@@ -6,6 +6,7 @@
 #include <array>
 #include <cerrno>
 #include <cstring>
+#include <dns_sd.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <string>
@@ -14,7 +15,6 @@
 #include <unistd.h>
 #include <vector>
 
-#import <CFNetwork/CFNetwork.h>
 #import <Foundation/Foundation.h>
 
 namespace iphonecam {
@@ -41,7 +41,7 @@ std::string errnoDescription(const char *operation)
 struct NetworkReceiver::Impl {
     dispatch_queue_t queue = dispatch_queue_create("iphonecam.obs.receiver", DISPATCH_QUEUE_SERIAL);
     dispatch_source_t readSource = nullptr;
-    CFNetServiceRef bonjourService = nullptr;
+    DNSServiceRef bonjourService = nullptr;
     int socketFd = -1;
     uint16_t port = 0;
     std::string activeEndpoint;
@@ -132,8 +132,7 @@ struct NetworkReceiver::Impl {
             socketFd = -1;
         }
         if (bonjourService) {
-            CFNetServiceCancel(bonjourService);
-            CFRelease(bonjourService);
+            DNSServiceRefDeallocate(bonjourService);
             bonjourService = nullptr;
         }
         port = 0;
@@ -142,22 +141,21 @@ struct NetworkReceiver::Impl {
 
     bool publishBonjour(const std::string &receiverName, uint16_t servicePort)
     {
-        CFStringRef name = CFStringCreateWithCString(kCFAllocatorDefault, receiverName.c_str(), kCFStringEncodingUTF8);
-        bonjourService =
-            CFNetServiceCreate(kCFAllocatorDefault, CFSTR(""), CFSTR("_iphonecam._udp."), name, servicePort);
-        if (name)
-            CFRelease(name);
-        if (!bonjourService) {
-            fail("Bonjour service creation failed");
-            return false;
-        }
-
-        CFStreamError error = {};
-        if (!CFNetServiceRegisterWithOptions(bonjourService, 0, &error)) {
-            const std::string message =
-                "Bonjour publish failed: domain " + std::to_string(error.domain) + " error " + std::to_string(error.error);
+        const DNSServiceErrorType error = DNSServiceRegister(
+            &bonjourService, 0, 0, receiverName.c_str(), "_iphonecam._udp.", nullptr, nullptr, htons(servicePort), 0,
+            nullptr,
+            [](DNSServiceRef, DNSServiceFlags, DNSServiceErrorType errorCode, const char *name, const char *,
+               const char *, void *) {
+              if (errorCode == kDNSServiceErr_NoError) {
+                  blog(LOG_INFO, "[iPhoneCam] OBS Bonjour service registered as '%s'", name ? name : "iPhoneCam OBS");
+              } else {
+                  blog(LOG_ERROR, "[iPhoneCam] OBS Bonjour registration callback error: %d", int(errorCode));
+              }
+            },
+            nullptr);
+        if (error != kDNSServiceErr_NoError) {
+            const std::string message = "Bonjour publish failed: " + std::to_string(int(error));
             fail(message);
-            CFRelease(bonjourService);
             bonjourService = nullptr;
             return false;
         }

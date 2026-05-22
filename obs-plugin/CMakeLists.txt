@@ -74,7 +74,6 @@ if(APPLE AND IPHONECAM_BUILD_OBS_PLUGIN)
         iphonecam_obs_core
         "${LIBOBS_FRAMEWORK}"
         "-framework Foundation"
-        "-framework CFNetwork"
         "-framework VideoToolbox"
         "-framework CoreMedia"
         "-framework CoreVideo"
