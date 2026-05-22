@@ -1,39 +1,49 @@
 #include "network_receiver.hpp"
 #include "protocol.hpp"
 
+#include <util/base.h>
+
+#include <array>
+#include <cerrno>
+#include <cstring>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <string>
+#include <sys/fcntl.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#include <vector>
+
+#import <CFNetwork/CFNetwork.h>
 #import <Foundation/Foundation.h>
-#import <Network/Network.h>
 
 namespace iphonecam {
 namespace {
 
-std::string endpointDescription(nw_connection_t connection)
+std::string endpointDescription(const sockaddr_storage &address, socklen_t addressLength)
 {
-    nw_endpoint_t endpoint = nw_connection_copy_endpoint(connection);
-    if (!endpoint)
+    char host[NI_MAXHOST] = {};
+    char service[NI_MAXSERV] = {};
+    const int result = getnameinfo(reinterpret_cast<const sockaddr *>(&address), addressLength, host, sizeof(host),
+                                   service, sizeof(service), NI_NUMERICHOST | NI_NUMERICSERV);
+    if (result != 0)
         return "unknown";
-    std::string description = "unknown";
-    if (nw_endpoint_get_type(endpoint) == nw_endpoint_type_host) {
-        const char *host = nw_endpoint_get_hostname(endpoint);
-        const uint16_t port = nw_endpoint_get_port(endpoint);
-        description = std::string(host ? host : "unknown") + ":" + std::to_string(port);
-    }
-    return description;
+    return std::string(host) + ":" + std::string(service);
 }
 
-std::string errorDescription(nw_error_t error)
+std::string errnoDescription(const char *operation)
 {
-    if (!error)
-        return "";
-    return std::string("network error ") + std::to_string(nw_error_get_error_code(error));
+    return std::string(operation) + " failed: " + std::strerror(errno);
 }
 
 } // namespace
 
 struct NetworkReceiver::Impl {
     dispatch_queue_t queue = dispatch_queue_create("iphonecam.obs.receiver", DISPATCH_QUEUE_SERIAL);
-    nw_listener_t listener = nullptr;
-    nw_connection_t activeConnection = nullptr;
+    dispatch_source_t readSource = nullptr;
+    CFNetServiceRef bonjourService = nullptr;
+    int socketFd = -1;
+    uint16_t port = 0;
     std::string activeEndpoint;
     PacketCallback onPacket;
     StatusCallback onStatus;
@@ -50,105 +60,148 @@ struct NetworkReceiver::Impl {
     {
         stop();
 
-        nw_parameters_t parameters = nw_parameters_create_secure_udp(NW_PARAMETERS_DISABLE_PROTOCOL,
-                                                                     NW_PARAMETERS_DEFAULT_CONFIGURATION);
-        listener = nw_listener_create_with_port("0", parameters);
-        if (!listener) {
-            publishStatus("Receiver failed", 0);
+        int fd = socket(AF_INET6, SOCK_DGRAM, IPPROTO_UDP);
+        if (fd < 0) {
+            fail(errnoDescription("socket"));
             return;
         }
 
-        nw_advertise_descriptor_t advertise =
-            nw_advertise_descriptor_create_bonjour_service(receiverName.c_str(), kBonjourServiceType, nullptr);
-        nw_listener_set_advertise_descriptor(listener, advertise);
-        nw_listener_set_queue(listener, queue);
+        const int yes = 1;
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+        const int no = 0;
+        setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &no, sizeof(no));
 
-        nw_listener_set_state_changed_handler(listener, ^(nw_listener_state_t state, nw_error_t error) {
-          switch (state) {
-          case nw_listener_state_ready: {
-              const uint16_t port = nw_listener_get_port(listener);
-              publishStatus("Waiting for iPhone", port);
-              break;
-          }
-          case nw_listener_state_failed:
-              publishStatus("Receiver failed: " + errorDescription(error), 0);
-              break;
-          case nw_listener_state_waiting:
-              publishStatus("Receiver waiting: " + errorDescription(error), 0);
-              break;
-          case nw_listener_state_cancelled:
-              publishStatus("Receiver stopped", 0);
-              break;
-          default:
-              break;
-          }
+        sockaddr_in6 address = {};
+        address.sin6_family = AF_INET6;
+        address.sin6_addr = in6addr_any;
+        address.sin6_port = 0;
+        if (bind(fd, reinterpret_cast<const sockaddr *>(&address), sizeof(address)) < 0) {
+            const std::string message = errnoDescription("bind");
+            close(fd);
+            fail(message);
+            return;
+        }
+
+        sockaddr_in6 boundAddress = {};
+        socklen_t boundLength = sizeof(boundAddress);
+        if (getsockname(fd, reinterpret_cast<sockaddr *>(&boundAddress), &boundLength) < 0) {
+            const std::string message = errnoDescription("getsockname");
+            close(fd);
+            fail(message);
+            return;
+        }
+
+        if (fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK) < 0) {
+            const std::string message = errnoDescription("fcntl");
+            close(fd);
+            fail(message);
+            return;
+        }
+
+        socketFd = fd;
+        port = ntohs(boundAddress.sin6_port);
+        if (!publishBonjour(receiverName, port)) {
+            close(socketFd);
+            socketFd = -1;
+            port = 0;
+            return;
+        }
+
+        const int sourceFd = socketFd;
+        readSource = dispatch_source_create(DISPATCH_SOURCE_TYPE_READ, static_cast<uintptr_t>(sourceFd), 0, queue);
+        dispatch_source_set_event_handler(readSource, ^{
+          receiveAvailable();
         });
-
-        nw_listener_set_new_connection_handler(listener, ^(nw_connection_t connection) {
-          const std::string endpoint = endpointDescription(connection);
-          if (activeConnection && endpoint != activeEndpoint) {
-              nw_connection_cancel(connection);
-              return;
-          }
-
-          activeConnection = connection;
-          activeEndpoint = endpoint;
-          nw_connection_set_queue(connection, queue);
-          nw_connection_set_state_changed_handler(connection, ^(nw_connection_state_t state, nw_error_t error) {
-            switch (state) {
-            case nw_connection_state_ready:
-                publishStatus("Connected: " + activeEndpoint, nw_listener_get_port(listener));
-                break;
-            case nw_connection_state_failed:
-                publishStatus("Connection failed: " + errorDescription(error), nw_listener_get_port(listener));
-                activeConnection = nullptr;
-                activeEndpoint.clear();
-                break;
-            case nw_connection_state_cancelled:
-                activeConnection = nullptr;
-                activeEndpoint.clear();
-                publishStatus("Waiting for iPhone", listener ? nw_listener_get_port(listener) : 0);
-                break;
-            default:
-                break;
-            }
-          });
-          nw_connection_start(connection);
-          receive(connection);
+        dispatch_source_set_cancel_handler(readSource, ^{
+          close(sourceFd);
         });
+        dispatch_resume(readSource);
 
-        nw_listener_start(listener);
+        blog(LOG_INFO, "[iPhoneCam] OBS UDP receiver listening as '%s' on port %u", receiverName.c_str(), port);
+        publishStatus("Waiting for iPhone", port);
     }
 
     void stop()
     {
-        if (activeConnection) {
-            nw_connection_cancel(activeConnection);
-            activeConnection = nullptr;
+        if (readSource) {
+            dispatch_source_cancel(readSource);
+            readSource = nullptr;
+            socketFd = -1;
+        } else if (socketFd >= 0) {
+            close(socketFd);
+            socketFd = -1;
         }
+        if (bonjourService) {
+            CFNetServiceCancel(bonjourService);
+            CFRelease(bonjourService);
+            bonjourService = nullptr;
+        }
+        port = 0;
         activeEndpoint.clear();
-        if (listener) {
-            nw_listener_cancel(listener);
-            listener = nullptr;
+    }
+
+    bool publishBonjour(const std::string &receiverName, uint16_t servicePort)
+    {
+        CFStringRef name = CFStringCreateWithCString(kCFAllocatorDefault, receiverName.c_str(), kCFStringEncodingUTF8);
+        bonjourService =
+            CFNetServiceCreate(kCFAllocatorDefault, CFSTR(""), CFSTR("_iphonecam._udp."), name, servicePort);
+        if (name)
+            CFRelease(name);
+        if (!bonjourService) {
+            fail("Bonjour service creation failed");
+            return false;
+        }
+
+        CFStreamError error = {};
+        if (!CFNetServiceRegisterWithOptions(bonjourService, 0, &error)) {
+            const std::string message =
+                "Bonjour publish failed: domain " + std::to_string(error.domain) + " error " + std::to_string(error.error);
+            fail(message);
+            CFRelease(bonjourService);
+            bonjourService = nullptr;
+            return false;
+        }
+        blog(LOG_INFO, "[iPhoneCam] OBS Bonjour service published on _iphonecam._udp.:%u", servicePort);
+        return true;
+    }
+
+    void receiveAvailable()
+    {
+        std::array<uint8_t, 4096> buffer = {};
+        for (;;) {
+            sockaddr_storage sender = {};
+            socklen_t senderLength = sizeof(sender);
+            const ssize_t bytesRead =
+                recvfrom(socketFd, buffer.data(), buffer.size(), 0, reinterpret_cast<sockaddr *>(&sender), &senderLength);
+            if (bytesRead < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK)
+                    break;
+                blog(LOG_WARNING, "[iPhoneCam] OBS UDP recvfrom failed: %s", std::strerror(errno));
+                break;
+            }
+            if (bytesRead == 0)
+                continue;
+
+            const std::string endpoint = endpointDescription(sender, senderLength);
+            if (activeEndpoint.empty()) {
+                activeEndpoint = endpoint;
+                blog(LOG_INFO, "[iPhoneCam] OBS receiver accepted iPhone endpoint %s", activeEndpoint.c_str());
+                publishStatus("Connected: " + activeEndpoint, port);
+            } else if (endpoint != activeEndpoint) {
+                blog(LOG_INFO, "[iPhoneCam] OBS receiver ignored second endpoint %s", endpoint.c_str());
+                continue;
+            }
+
+            if (onPacket) {
+                onPacket(std::vector<uint8_t>(buffer.begin(), buffer.begin() + bytesRead));
+            }
         }
     }
 
-    void receive(nw_connection_t connection)
+    void fail(const std::string &message)
     {
-        nw_connection_receive_message(connection, ^(dispatch_data_t content, nw_content_context_t, bool,
-                                                   nw_error_t error) {
-          if (content) {
-              const void *buffer = nullptr;
-              size_t size = 0;
-              dispatch_data_t mapped = dispatch_data_create_map(content, &buffer, &size);
-              if (mapped && buffer && size > 0 && onPacket) {
-                  const auto *bytes = static_cast<const uint8_t *>(buffer);
-                  onPacket(std::vector<uint8_t>(bytes, bytes + size));
-              }
-          }
-          if (!error)
-              receive(connection);
-        });
+        blog(LOG_ERROR, "[iPhoneCam] OBS receiver error: %s", message.c_str());
+        publishStatus("Receiver failed: " + message, 0);
     }
 };
 
