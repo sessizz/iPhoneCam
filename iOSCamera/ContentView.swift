@@ -16,7 +16,7 @@ struct ContentView: View {
                 CameraPreview(session: model.capture.session, rotationAngle: model.capture.videoRotationAngle)
                     .ignoresSafeArea()
 
-                controlOverlay(compact: compact)
+                controlOverlay(size: proxy.size, compact: compact)
                     .ignoresSafeArea()
             }
         }
@@ -31,9 +31,9 @@ struct ContentView: View {
         }
     }
 
-    private func controlOverlay(compact: Bool) -> some View {
+    private func controlOverlay(size: CGSize, compact: Bool) -> some View {
         ZStack {
-            zoomSidePanel(compact: compact)
+            zoomSidePanel(compact: compact, availableHeight: size.height)
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
                 .padding(.leading, compact ? 10 : 16)
                 .padding(.vertical, compact ? 10 : 16)
@@ -142,8 +142,12 @@ struct ContentView: View {
         .frame(width: 220)
     }
 
-    private func zoomSidePanel(compact: Bool) -> some View {
-        VStack(spacing: 10) {
+    private func zoomSidePanel(compact: Bool, availableHeight: CGFloat) -> some View {
+        let minimumHeight: CGFloat = compact ? 350 : 500
+        let verticalClearance: CGFloat = compact ? 28 : 44
+        let panelHeight = min(max(minimumHeight, availableHeight - verticalClearance), max(260, availableHeight - 12))
+
+        return VStack(spacing: 10) {
             Text(String(format: "%.1fx", model.capture.zoomFactor))
                 .font(.title3.monospacedDigit().weight(.semibold))
                 .frame(width: 74)
@@ -156,9 +160,11 @@ struct ContentView: View {
                 onChanged: model.updateZoomJog,
                 onEnded: model.stopZoomJog
             )
-            .frame(width: 74, height: compact ? 158 : 224)
+            .frame(width: 74)
+            .frame(maxHeight: .infinity)
         }
-        .padding(10)
+        .padding(.vertical, 14)
+        .frame(width: 94, height: panelHeight)
         .background(.black.opacity(0.46), in: RoundedRectangle(cornerRadius: 8))
         .foregroundStyle(.white)
     }
@@ -303,7 +309,7 @@ private struct ZoomJogControl: View {
         GeometryReader { proxy in
             let height = proxy.size.height
             let width = proxy.size.width
-            let usableDistance = max(1, height / 2 - 28)
+            let usableDistance = max(1, height / 2 - 18)
             let clampedOffset = min(max(dragOffset, -usableDistance), usableDistance)
             let centerY = height / 2
 
