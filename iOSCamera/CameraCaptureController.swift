@@ -25,6 +25,7 @@ final class CameraCaptureController: NSObject, ObservableObject, @unchecked Send
     private var zoomPollTimer: DispatchSourceTimer?
     private var configured = false
     private var currentRotationAngle: CGFloat = 0
+    private var displayZoomFactorMultiplier: CGFloat = 1
     private var lastContinuousZoomIntensity: Double = 0
     private var lastContinuousZoomCommand = Date.distantPast
     private let maximumPresentedZoomFactor: CGFloat = 8
@@ -73,7 +74,7 @@ final class CameraCaptureController: NSObject, ObservableObject, @unchecked Send
                 return
             }
 
-            let target = self.clampedZoomFactor(factor, for: device)
+            let target = self.clampedDeviceZoomFactor(forDisplayedFactor: factor, on: device)
             do {
                 try device.lockForConfiguration()
                 defer { device.unlockForConfiguration() }
@@ -116,9 +117,9 @@ final class CameraCaptureController: NSObject, ObservableObject, @unchecked Send
 
             self.lastContinuousZoomIntensity = clampedIntensity
             self.lastContinuousZoomCommand = now
-            let target = clampedIntensity > 0 ? self.maximumZoomFactor(for: device) : device.minAvailableVideoZoomFactor
+            let target = clampedIntensity > 0 ? self.maximumDeviceZoomFactor(for: device) : device.minAvailableVideoZoomFactor
             let normalizedSpeed = pow(abs(clampedIntensity), 1.25)
-            let rate = Float(0.18 + normalizedSpeed * 3.4)
+            let rate = Float(0.14 + normalizedSpeed * 4.2)
 
             do {
                 try device.lockForConfiguration()
@@ -160,6 +161,9 @@ final class CameraCaptureController: NSObject, ObservableObject, @unchecked Send
                         self?.activeFormatText = "\(selected.width)x\(selected.height) @ \(selected.fps) FPS"
                     }
                 }
+                if let captureDevice {
+                    self.setInitialZoom(on: captureDevice)
+                }
                 self.session.startRunning()
                 self.startZoomPolling()
                 DispatchQueue.main.async { [weak self] in
@@ -183,6 +187,7 @@ final class CameraCaptureController: NSObject, ObservableObject, @unchecked Send
         let device = selection.device
         let selected = selection.format
         captureDevice = device
+        displayZoomFactorMultiplier = Self.displayZoomFactorMultiplier(for: device)
 
         let input = try AVCaptureDeviceInput(device: device)
         guard session.canAddInput(input) else {
@@ -203,6 +208,7 @@ final class CameraCaptureController: NSObject, ObservableObject, @unchecked Send
         videoOutput = output
 
         applyCurrentRotation()
+        setInitialZoom(on: device)
         updateZoomCapabilities(for: device, selectedFormat: selected)
 
         return selected
@@ -280,6 +286,22 @@ final class CameraCaptureController: NSObject, ObservableObject, @unchecked Send
         return devices
     }
 
+    private static func displayZoomFactorMultiplier(for device: AVCaptureDevice) -> CGFloat {
+        if #available(iOS 18.0, *) {
+            return max(device.displayVideoZoomFactorMultiplier, 0.01)
+        }
+
+        switch device.deviceType {
+        case .builtInTripleCamera, .builtInDualWideCamera:
+            guard let firstSwitchOver = device.virtualDeviceSwitchOverVideoZoomFactors.first else {
+                return 0.5
+            }
+            return 1 / max(CGFloat(truncating: firstSwitchOver), 0.01)
+        default:
+            return 1
+        }
+    }
+
     private func selectFormat(on device: AVCaptureDevice) throws -> SelectedCameraFormat {
         let targetWidth = Int32(CameraProtocol.targetWidth)
         let targetHeight = Int32(CameraProtocol.targetHeight)
@@ -314,15 +336,15 @@ final class CameraCaptureController: NSObject, ObservableObject, @unchecked Send
     }
 
     private func updateZoomCapabilities(for device: AVCaptureDevice, selectedFormat: SelectedCameraFormat) {
-        let minimum = device.minAvailableVideoZoomFactor
-        let maximum = maximumZoomFactor(for: device)
+        let minimum = displayedZoomFactor(forDeviceZoomFactor: device.minAvailableVideoZoomFactor)
+        let maximum = displayedZoomFactor(forDeviceZoomFactor: maximumDeviceZoomFactor(for: device))
         let switchOvers = device.virtualDeviceSwitchOverVideoZoomFactors
-            .map { CGFloat(truncating: $0) }
+            .map { displayedZoomFactor(forDeviceZoomFactor: CGFloat(truncating: $0)) }
             .filter { $0 >= minimum && $0 <= maximum }
         let cameraText = device.isVirtualDevice ? "Virtual camera: \(device.localizedName)" : "Single camera: \(device.localizedName)"
         let virtualWarning = device.isVirtualDevice ? nil : "Virtual camera unavailable; lens switching disabled."
         let warnings = [selectedFormat.warning, virtualWarning].compactMap { $0 }
-        let currentZoom = device.videoZoomFactor
+        let currentZoom = displayedZoomFactor(forDeviceZoomFactor: device.videoZoomFactor)
 
         DispatchQueue.main.async { [weak self] in
             self?.minZoomFactor = minimum
@@ -354,8 +376,9 @@ final class CameraCaptureController: NSObject, ObservableObject, @unchecked Send
     }
 
     private func publishZoom(_ zoomFactor: CGFloat) {
+        let displayedZoomFactor = displayedZoomFactor(forDeviceZoomFactor: zoomFactor)
         DispatchQueue.main.async { [weak self] in
-            self?.zoomFactor = zoomFactor
+            self?.zoomFactor = displayedZoomFactor
         }
     }
 
@@ -381,12 +404,33 @@ final class CameraCaptureController: NSObject, ObservableObject, @unchecked Send
         }
     }
 
-    private func clampedZoomFactor(_ factor: CGFloat, for device: AVCaptureDevice) -> CGFloat {
-        min(max(factor, device.minAvailableVideoZoomFactor), maximumZoomFactor(for: device))
+    private func setInitialZoom(on device: AVCaptureDevice) {
+        let target = clampedDeviceZoomFactor(forDisplayedFactor: 1, on: device)
+        do {
+            try device.lockForConfiguration()
+            defer { device.unlockForConfiguration() }
+            device.videoZoomFactor = target
+        } catch {
+            publishWarning(error.localizedDescription)
+        }
     }
 
-    private func maximumZoomFactor(for device: AVCaptureDevice) -> CGFloat {
-        min(device.maxAvailableVideoZoomFactor, device.activeFormat.videoMaxZoomFactor, maximumPresentedZoomFactor)
+    private func clampedDeviceZoomFactor(forDisplayedFactor factor: CGFloat, on device: AVCaptureDevice) -> CGFloat {
+        let deviceFactor = deviceZoomFactor(forDisplayedZoomFactor: factor)
+        return min(max(deviceFactor, device.minAvailableVideoZoomFactor), maximumDeviceZoomFactor(for: device))
+    }
+
+    private func maximumDeviceZoomFactor(for device: AVCaptureDevice) -> CGFloat {
+        let displayedLimitAsDeviceFactor = deviceZoomFactor(forDisplayedZoomFactor: maximumPresentedZoomFactor)
+        return min(device.maxAvailableVideoZoomFactor, device.activeFormat.videoMaxZoomFactor, displayedLimitAsDeviceFactor)
+    }
+
+    private func displayedZoomFactor(forDeviceZoomFactor factor: CGFloat) -> CGFloat {
+        factor * displayZoomFactorMultiplier
+    }
+
+    private func deviceZoomFactor(forDisplayedZoomFactor factor: CGFloat) -> CGFloat {
+        factor / displayZoomFactorMultiplier
     }
 }
 

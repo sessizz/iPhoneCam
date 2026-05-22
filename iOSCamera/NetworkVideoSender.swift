@@ -68,6 +68,9 @@ final class NetworkVideoSender: @unchecked Sendable {
             self?.connection?.cancel()
             self?.connection = nil
             self?.ready = false
+            self?.sentFrames = 0
+            self?.sentBytes = 0
+            self?.lastStatsDate = Date()
         }
     }
 

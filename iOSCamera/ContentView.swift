@@ -13,6 +13,8 @@ struct ContentView: View {
                     .ignoresSafeArea()
 
                 HStack(alignment: .top, spacing: 16) {
+                    zoomSidePanel(compact: compact)
+
                     VStack(alignment: .leading, spacing: 12) {
                         statusPanel
                         Spacer()
@@ -21,8 +23,6 @@ struct ContentView: View {
                     .frame(maxWidth: compact ? 560 : 680, alignment: .leading)
 
                     Spacer(minLength: 0)
-
-                    zoomSidePanel(compact: compact)
                 }
                 .padding(compact ? 10 : 16)
             }
@@ -106,8 +106,8 @@ struct ContentView: View {
                 Button {
                     model.zoom(to: factor)
                 } label: {
-                    Text("\(Int(factor))x")
-                        .frame(width: 38, height: 30)
+                    Text(model.zoomLabel(for: factor))
+                        .frame(width: 44, height: 30)
                 }
                 .buttonStyle(ZoomPresetButtonStyle())
                 .disabled(!model.isZoomPresetAvailable(factor))
@@ -157,7 +157,7 @@ final class CameraViewModel: ObservableObject {
     @Published var presetRampDuration = 1.2
 
     let capture = CameraCaptureController()
-    let zoomPresets: [CGFloat] = [1, 2, 4, 8]
+    let zoomPresets: [CGFloat] = [0.5, 1, 2, 4, 8]
 
     private let browser = BonjourBrowser()
     private let sender = NetworkVideoSender()
@@ -232,16 +232,22 @@ final class CameraViewModel: ObservableObject {
     }
 
     func reconnect() {
-        networkStatus = "Reconnecting to Mac..."
-        sender.stop()
-        browser.start()
-        if let lastEndpoint {
-            sender.connect(to: lastEndpoint, force: true)
+        networkStatus = "Restarting connection..."
+        senderStats = "0 frames sent"
+        lastEndpoint = nil
+        stop()
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 350_000_000)
+            self?.start()
         }
     }
 
     func isZoomPresetAvailable(_ factor: CGFloat) -> Bool {
         factor >= capture.minZoomFactor - 0.01 && factor <= capture.maxZoomFactor + 0.01
+    }
+
+    func zoomLabel(for factor: CGFloat) -> String {
+        factor < 1 ? String(format: "%.1fx", factor) : "\(Int(factor))x"
     }
 
     private func currentInterfaceOrientation() -> UIInterfaceOrientation? {
