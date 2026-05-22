@@ -7,6 +7,11 @@ final class CameraCaptureController: NSObject, ObservableObject, @unchecked Send
     @Published var warningText: String?
     @Published var activeFormatText = "1080p60 target"
     @Published private(set) var videoRotationAngle: CGFloat = 0
+    @Published private(set) var zoomFactor: CGFloat = 1
+    @Published private(set) var minZoomFactor: CGFloat = 1
+    @Published private(set) var maxZoomFactor: CGFloat = 1
+    @Published private(set) var switchOverZoomFactors: [CGFloat] = []
+    @Published private(set) var cameraModeText = "Back camera"
 
     let session = AVCaptureSession()
 
@@ -15,9 +20,14 @@ final class CameraCaptureController: NSObject, ObservableObject, @unchecked Send
 
     private let sessionQueue = DispatchQueue(label: "iphonecam.capture.session")
     private var videoOutput: AVCaptureVideoDataOutput?
+    private var captureDevice: AVCaptureDevice?
     private var encoder: H264Encoder?
+    private var zoomPollTimer: DispatchSourceTimer?
     private var configured = false
     private var currentRotationAngle: CGFloat = 0
+    private var lastContinuousZoomIntensity: Double = 0
+    private var lastContinuousZoomCommand = Date.distantPast
+    private let maximumPresentedZoomFactor: CGFloat = 8
 
     func start() {
         switch AVCaptureDevice.authorizationStatus(for: .video) {
@@ -40,6 +50,8 @@ final class CameraCaptureController: NSObject, ObservableObject, @unchecked Send
 
     func stop() {
         sessionQueue.async { [weak self] in
+            self?.stopContinuousZoomOnQueue()
+            self?.stopZoomPolling()
             self?.session.stopRunning()
         }
     }
@@ -52,6 +64,75 @@ final class CameraCaptureController: NSObject, ObservableObject, @unchecked Send
         videoRotationAngle = angle
         sessionQueue.async { [weak self] in
             self?.applyCurrentRotation()
+        }
+    }
+
+    func rampZoom(to factor: CGFloat, duration: Double) {
+        sessionQueue.async { [weak self] in
+            guard let self, let device = self.captureDevice else {
+                return
+            }
+
+            let target = self.clampedZoomFactor(factor, for: device)
+            do {
+                try device.lockForConfiguration()
+                defer { device.unlockForConfiguration() }
+
+                let current = max(device.videoZoomFactor, 0.01)
+                let ratio = max(Double(target / current), 0.01)
+                let rate = max(0.05, min(8, abs(log2(ratio)) / max(duration, 0.15)))
+                if abs(target - current) < 0.01 {
+                    device.cancelVideoZoomRamp()
+                    device.videoZoomFactor = target
+                } else {
+                    device.ramp(toVideoZoomFactor: target, withRate: Float(rate))
+                }
+                self.publishZoom(device.videoZoomFactor)
+            } catch {
+                self.publishWarning(error.localizedDescription)
+            }
+        }
+    }
+
+    func updateContinuousZoom(intensity: Double) {
+        let clampedIntensity = max(-1, min(1, intensity))
+        sessionQueue.async { [weak self] in
+            guard let self, let device = self.captureDevice else {
+                return
+            }
+
+            guard abs(clampedIntensity) >= 0.04 else {
+                self.stopContinuousZoomOnQueue()
+                return
+            }
+
+            let now = Date()
+            guard
+                abs(clampedIntensity - self.lastContinuousZoomIntensity) >= 0.035 ||
+                now.timeIntervalSince(self.lastContinuousZoomCommand) >= 0.25
+            else {
+                return
+            }
+
+            self.lastContinuousZoomIntensity = clampedIntensity
+            self.lastContinuousZoomCommand = now
+            let target = clampedIntensity > 0 ? self.maximumZoomFactor(for: device) : device.minAvailableVideoZoomFactor
+            let normalizedSpeed = pow(abs(clampedIntensity), 1.25)
+            let rate = Float(0.18 + normalizedSpeed * 3.4)
+
+            do {
+                try device.lockForConfiguration()
+                defer { device.unlockForConfiguration() }
+                device.ramp(toVideoZoomFactor: target, withRate: rate)
+            } catch {
+                self.publishWarning(error.localizedDescription)
+            }
+        }
+    }
+
+    func stopContinuousZoom() {
+        sessionQueue.async { [weak self] in
+            self?.stopContinuousZoomOnQueue()
         }
     }
 
@@ -77,10 +158,10 @@ final class CameraCaptureController: NSObject, ObservableObject, @unchecked Send
                     self.configured = true
                     DispatchQueue.main.async { [weak self] in
                         self?.activeFormatText = "\(selected.width)x\(selected.height) @ \(selected.fps) FPS"
-                        self?.warningText = selected.warning
                     }
                 }
                 self.session.startRunning()
+                self.startZoomPolling()
                 DispatchQueue.main.async { [weak self] in
                     self?.statusText = "Camera streaming"
                 }
@@ -98,11 +179,10 @@ final class CameraCaptureController: NSObject, ObservableObject, @unchecked Send
         session.sessionPreset = .inputPriority
         defer { session.commitConfiguration() }
 
-        guard let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back) else {
-            throw CameraCaptureError.noBackCamera
-        }
-
-        let selected = try selectFormat(on: device)
+        let selection = try selectBackCamera()
+        let device = selection.device
+        let selected = selection.format
+        captureDevice = device
 
         let input = try AVCaptureDeviceInput(device: device)
         guard session.canAddInput(input) else {
@@ -123,6 +203,7 @@ final class CameraCaptureController: NSObject, ObservableObject, @unchecked Send
         videoOutput = output
 
         applyCurrentRotation()
+        updateZoomCapabilities(for: device, selectedFormat: selected)
 
         return selected
     }
@@ -159,6 +240,46 @@ final class CameraCaptureController: NSObject, ObservableObject, @unchecked Send
         }
     }
 
+    private func selectBackCamera() throws -> (device: AVCaptureDevice, format: SelectedCameraFormat) {
+        let devices = Self.preferredBackCameras()
+        guard !devices.isEmpty else {
+            throw CameraCaptureError.noBackCamera
+        }
+
+        for device in devices {
+            if let format = try? selectFormat(on: device) {
+                return (device, format)
+            }
+        }
+
+        throw CameraCaptureError.no1080pFormat
+    }
+
+    private static func preferredBackCameras() -> [AVCaptureDevice] {
+        let preferredTypes: [AVCaptureDevice.DeviceType] = [
+            .builtInTripleCamera,
+            .builtInDualWideCamera,
+            .builtInDualCamera,
+            .builtInWideAngleCamera
+        ]
+        let discovery = AVCaptureDevice.DiscoverySession(
+            deviceTypes: preferredTypes,
+            mediaType: .video,
+            position: .back
+        )
+
+        var devices = preferredTypes.compactMap { type in
+            discovery.devices.first { $0.deviceType == type }
+        }
+        if
+            devices.isEmpty,
+            let wide = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back)
+        {
+            devices.append(wide)
+        }
+        return devices
+    }
+
     private func selectFormat(on device: AVCaptureDevice) throws -> SelectedCameraFormat {
         let targetWidth = Int32(CameraProtocol.targetWidth)
         let targetHeight = Int32(CameraProtocol.targetHeight)
@@ -190,6 +311,82 @@ final class CameraCaptureController: NSObject, ObservableObject, @unchecked Send
 
         let warning = fps == CameraProtocol.targetFPS ? nil : "1080p60 unsupported; using 1080p\(fps)."
         return SelectedCameraFormat(width: CameraProtocol.targetWidth, height: CameraProtocol.targetHeight, fps: fps, warning: warning)
+    }
+
+    private func updateZoomCapabilities(for device: AVCaptureDevice, selectedFormat: SelectedCameraFormat) {
+        let minimum = device.minAvailableVideoZoomFactor
+        let maximum = maximumZoomFactor(for: device)
+        let switchOvers = device.virtualDeviceSwitchOverVideoZoomFactors
+            .map { CGFloat(truncating: $0) }
+            .filter { $0 >= minimum && $0 <= maximum }
+        let cameraText = device.isVirtualDevice ? "Virtual camera: \(device.localizedName)" : "Single camera: \(device.localizedName)"
+        let virtualWarning = device.isVirtualDevice ? nil : "Virtual camera unavailable; lens switching disabled."
+        let warnings = [selectedFormat.warning, virtualWarning].compactMap { $0 }
+        let currentZoom = device.videoZoomFactor
+
+        DispatchQueue.main.async { [weak self] in
+            self?.minZoomFactor = minimum
+            self?.maxZoomFactor = maximum
+            self?.switchOverZoomFactors = switchOvers
+            self?.zoomFactor = currentZoom
+            self?.cameraModeText = cameraText
+            self?.warningText = warnings.isEmpty ? nil : warnings.joined(separator: " ")
+        }
+    }
+
+    private func startZoomPolling() {
+        stopZoomPolling()
+        let timer = DispatchSource.makeTimerSource(queue: sessionQueue)
+        timer.schedule(deadline: .now(), repeating: .milliseconds(80), leeway: .milliseconds(20))
+        timer.setEventHandler { [weak self] in
+            guard let self, let device = self.captureDevice else {
+                return
+            }
+            self.publishZoom(device.videoZoomFactor)
+        }
+        zoomPollTimer = timer
+        timer.resume()
+    }
+
+    private func stopZoomPolling() {
+        zoomPollTimer?.cancel()
+        zoomPollTimer = nil
+    }
+
+    private func publishZoom(_ zoomFactor: CGFloat) {
+        DispatchQueue.main.async { [weak self] in
+            self?.zoomFactor = zoomFactor
+        }
+    }
+
+    private func publishWarning(_ warning: String) {
+        DispatchQueue.main.async { [weak self] in
+            self?.warningText = warning
+        }
+    }
+
+    private func stopContinuousZoomOnQueue() {
+        guard let device = captureDevice else {
+            return
+        }
+        lastContinuousZoomIntensity = 0
+        lastContinuousZoomCommand = .distantPast
+        do {
+            try device.lockForConfiguration()
+            defer { device.unlockForConfiguration() }
+            device.cancelVideoZoomRamp()
+            publishZoom(device.videoZoomFactor)
+        } catch {
+            publishWarning(error.localizedDescription)
+        }
+    }
+
+    private func clampedZoomFactor(_ factor: CGFloat, for device: AVCaptureDevice) -> CGFloat {
+        min(max(factor, device.minAvailableVideoZoomFactor), maximumZoomFactor(for: device))
+    }
+
+    private func maximumZoomFactor(for device: AVCaptureDevice) -> CGFloat {
+        min(device.maxAvailableVideoZoomFactor, device.activeFormat.videoMaxZoomFactor, maximumPresentedZoomFactor)
     }
 }
 

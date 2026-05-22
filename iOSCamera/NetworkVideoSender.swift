@@ -16,10 +16,10 @@ final class NetworkVideoSender: @unchecked Sendable {
     private var connectionAttemptId = UUID()
     private let encoder = JSONEncoder()
 
-    func connect(to endpoint: NWEndpoint) {
+    func connect(to endpoint: NWEndpoint, force: Bool = false) {
         queue.async { [weak self] in
             guard let self else { return }
-            if self.connection?.endpoint.debugDescription == endpoint.debugDescription {
+            if !force, self.connection?.endpoint.debugDescription == endpoint.debugDescription {
                 return
             }
             self.ready = false
