@@ -72,6 +72,8 @@ IPhoneCamSource::IPhoneCamSource(obs_data_t *settings, obs_source_t *source)
       lastFrameAt_(std::chrono::steady_clock::now()),
       lastStatsAt_(std::chrono::steady_clock::now())
 {
+    obs_source_set_async_decoupled(source_, true);
+    obs_source_set_async_unbuffered(source_, true);
     receiver_->setStatusCallback([this](const std::string &status, uint16_t port) {
         std::lock_guard<std::mutex> lock(mutex_);
         stats_.status = status;
@@ -307,6 +309,12 @@ void IPhoneCamSource::outputDecodedFrame(const DecodedFrame &frame)
     obsFrame.timestamp = os_gettime_ns() + uint64_t(settings_.latencyMs) * 1000000ULL;
     obsFrame.format = VIDEO_FORMAT_NV12;
     obsFrame.full_range = frame.fullRange;
+    obsFrame.trc = VIDEO_TRC_DEFAULT;
+    const enum video_range_type range = frame.fullRange ? VIDEO_RANGE_FULL : VIDEO_RANGE_PARTIAL;
+    if (!video_format_get_parameters_for_format(VIDEO_CS_709, range, obsFrame.format, obsFrame.color_matrix,
+                                                obsFrame.color_range_min, obsFrame.color_range_max)) {
+        blog(LOG_WARNING, "[iPhoneCam] Failed to set OBS color parameters for decoded frame");
+    }
     obsFrame.flip = false;
     obs_source_output_video(source_, &obsFrame);
 }
@@ -328,6 +336,9 @@ void IPhoneCamSource::outputBlackFrame()
     obsFrame.timestamp = os_gettime_ns();
     obsFrame.format = VIDEO_FORMAT_NV12;
     obsFrame.full_range = true;
+    obsFrame.trc = VIDEO_TRC_DEFAULT;
+    video_format_get_parameters_for_format(VIDEO_CS_709, VIDEO_RANGE_FULL, obsFrame.format, obsFrame.color_matrix,
+                                           obsFrame.color_range_min, obsFrame.color_range_max);
     obs_source_output_video(source_, &obsFrame);
 }
 
