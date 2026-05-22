@@ -130,8 +130,6 @@ void IPhoneCamSource::videoTick(float)
         outputBlackFrame();
         noSignalOutput_ = true;
     }
-    if (statsDirty_.exchange(false))
-        obs_source_update_properties(source_);
 }
 
 uint32_t IPhoneCamSource::width() const
@@ -253,19 +251,19 @@ void IPhoneCamSource::handleFormat(const FormatPayload &format)
     }
     markStatsDirty();
 
-    auto formatCopy = std::make_shared<FormatPayload>(format);
-    dispatch_async(decodeQueue_, ^{
-      std::string error;
-      if (!decoder_->configure(*formatCopy, error)) {
-          blog(LOG_ERROR, "[iPhoneCam] Decoder configure failed: %s", error.c_str());
-          {
-              std::lock_guard<std::mutex> lock(mutex_);
-              stats_.status = "Format error: " + error;
-              stats_.waitingForKeyFrame = true;
-          }
-          markStatsDirty();
-      }
-    });
+    std::string error;
+    {
+        std::lock_guard<std::mutex> decoderLock(decoderMutex_);
+        if (!decoder_->configure(format, error)) {
+            blog(LOG_ERROR, "[iPhoneCam] Decoder configure failed: %s", error.c_str());
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                stats_.status = "Format error: " + error;
+                stats_.waitingForKeyFrame = true;
+            }
+            markStatsDirty();
+        }
+    }
 }
 
 void IPhoneCamSource::handleFrame(const EncodedVideoFrame &frame)
@@ -285,10 +283,20 @@ void IPhoneCamSource::handleFrame(const EncodedVideoFrame &frame)
         receivedFramesSinceStats_ += 1;
     }
 
-    auto frameCopy = std::make_shared<EncodedVideoFrame>(frame);
+    if (pendingDecodeFrames_.load() >= maxPendingDecodeFrames() && !frame.isKeyFrame) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            stats_.decodeDroppedFrames += 1;
+        }
+        markStatsDirty();
+        return;
+    }
+
+    auto *frameCopy = new EncodedVideoFrame(frame);
     pendingDecodeFrames_ += 1;
     dispatch_async(decodeQueue_, ^{
-      decodeFrame(*frameCopy);
+      std::unique_ptr<EncodedVideoFrame> frameGuard(frameCopy);
+      decodeFrame(*frameGuard);
       pendingDecodeFrames_ -= 1;
     });
 }
@@ -302,20 +310,23 @@ void IPhoneCamSource::decodeFrame(const EncodedVideoFrame &frame)
              static_cast<unsigned long long>(frame.frameId), frame.data.size(), frame.isKeyFrame ? "yes" : "no");
         decodeAttemptLogs_ += 1;
     }
-    if (!decoder_->decode(frame, decoded, error)) {
-        if (decodeErrorLogs_ < 10) {
-            blog(LOG_WARNING, "[iPhoneCam] Decode dropped frame %llu: %s",
-                 static_cast<unsigned long long>(frame.frameId), error.c_str());
-            decodeErrorLogs_ += 1;
+    {
+        std::lock_guard<std::mutex> decoderLock(decoderMutex_);
+        if (!decoder_->decode(frame, decoded, error)) {
+            if (decodeErrorLogs_ < 10) {
+                blog(LOG_WARNING, "[iPhoneCam] Decode dropped frame %llu: %s",
+                     static_cast<unsigned long long>(frame.frameId), error.c_str());
+                decodeErrorLogs_ += 1;
+            }
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                stats_.decodeDroppedFrames += 1;
+                stats_.status = "Decode error: " + error;
+                stats_.waitingForKeyFrame = true;
+            }
+            markStatsDirty();
+            return;
         }
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            stats_.decodeDroppedFrames += 1;
-            stats_.status = "Decode error: " + error;
-            stats_.waitingForKeyFrame = true;
-        }
-        markStatsDirty();
-        return;
     }
 
     outputDecodedFrame(decoded);
@@ -331,10 +342,19 @@ void IPhoneCamSource::decodeFrame(const EncodedVideoFrame &frame)
 
 void IPhoneCamSource::resetDecoder()
 {
-    dispatch_sync(decodeQueue_, ^{
-      decoder_->reset();
-      pendingDecodeFrames_ = 0;
-    });
+    dispatch_sync(decodeQueue_, ^{});
+    std::lock_guard<std::mutex> decoderLock(decoderMutex_);
+    decoder_->reset();
+    pendingDecodeFrames_ = 0;
+}
+
+int IPhoneCamSource::maxPendingDecodeFrames() const
+{
+    if (settings_.latencyMs == 0)
+        return 2;
+    if (settings_.latencyMs == 60)
+        return 5;
+    return 8;
 }
 
 void IPhoneCamSource::outputDecodedFrame(const DecodedFrame &frame)
@@ -447,13 +467,24 @@ static uint32_t iphonecam_get_height(void *data)
 static void iphonecam_defaults(obs_data_t *settings)
 {
     obs_data_set_default_string(settings, "receiver_name", "iPhoneCam OBS");
-    obs_data_set_default_int(settings, "latency_ms", 60);
+    obs_data_set_default_int(settings, "latency_ms", 0);
 }
 
 static bool iphonecam_restart_clicked(obs_properties_t *, obs_property_t *, void *data)
 {
     if (data)
         static_cast<IPhoneCamSource *>(data)->restart();
+    return true;
+}
+
+static bool iphonecam_refresh_stats_clicked(obs_properties_t *props, obs_property_t *, void *data)
+{
+    obs_property_t *statsProperty = obs_properties_get(props, "stats");
+    if (!statsProperty || !data)
+        return true;
+
+    const auto stats = static_cast<IPhoneCamSource *>(data)->stats();
+    obs_property_set_description(statsProperty, iphonecam::formatStats(stats).c_str());
     return true;
 }
 
@@ -469,6 +500,7 @@ static obs_properties_t *iphonecam_properties(void *data)
     obs_property_list_add_int(latency, "Smooth 120 ms", 120);
 
     obs_properties_add_button(props, "restart_receiver", "Restart Receiver", iphonecam_restart_clicked);
+    obs_properties_add_button(props, "refresh_stats", "Refresh Stats", iphonecam_refresh_stats_clicked);
     obs_properties_add_text(props, "no_signal_info", "No signal: last frame is held for 1s, then black.",
                             OBS_TEXT_INFO);
 

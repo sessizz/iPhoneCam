@@ -22,7 +22,7 @@ namespace iphonecam {
 
 struct SourceSettings {
     std::string receiverName = "iPhoneCam OBS";
-    int latencyMs = 60;
+    int latencyMs = 0;
 };
 
 struct SourceStats {
@@ -60,6 +60,7 @@ private:
     void handleFrame(const EncodedVideoFrame &frame);
     void decodeFrame(const EncodedVideoFrame &frame);
     void resetDecoder();
+    int maxPendingDecodeFrames() const;
     void outputDecodedFrame(const DecodedFrame &frame);
     void outputBlackFrame();
     void updateFpsCounters();
@@ -72,6 +73,7 @@ private:
     SourceStats stats_;
     std::unique_ptr<NetworkReceiver> receiver_;
     std::unique_ptr<VideoDecoder> decoder_;
+    std::mutex decoderMutex_;
     dispatch_queue_t decodeQueue_ = dispatch_queue_create("iphonecam.obs.decode", DISPATCH_QUEUE_SERIAL);
     FrameReassembler reassembler_;
     std::chrono::steady_clock::time_point lastFrameAt_;
