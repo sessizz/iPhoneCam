@@ -8,16 +8,12 @@ struct CameraPreview: UIViewRepresentable {
 
     func makeUIView(context: Context) -> PreviewView {
         let view = PreviewView()
-        view.previewLayer.session = session
-        view.previewLayer.videoGravity = .resizeAspect
-        view.previewLayer.backgroundColor = UIColor.black.cgColor
-        view.apply(rotationAngle: rotationAngle)
+        view.configure(session: session, rotationAngle: rotationAngle)
         return view
     }
 
     func updateUIView(_ uiView: PreviewView, context: Context) {
-        uiView.previewLayer.session = session
-        uiView.apply(rotationAngle: rotationAngle)
+        uiView.configure(session: session, rotationAngle: rotationAngle)
     }
 }
 
@@ -30,13 +26,58 @@ final class PreviewView: UIView {
         layer as! AVCaptureVideoPreviewLayer
     }
 
-    func apply(rotationAngle: CGFloat) {
-        guard
-            let connection = previewLayer.connection,
-            connection.isVideoRotationAngleSupported(rotationAngle)
-        else {
+    private var pendingRotationAngle: CGFloat = 0
+    private var rotationRetryWorkItem: DispatchWorkItem?
+
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        applyPendingRotation(retryIfNeeded: true)
+    }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        applyPendingRotation(retryIfNeeded: true)
+    }
+
+    func configure(session: AVCaptureSession, rotationAngle: CGFloat) {
+        if previewLayer.session !== session {
+            previewLayer.session = session
+            previewLayer.videoGravity = .resizeAspect
+            previewLayer.backgroundColor = UIColor.black.cgColor
+        }
+
+        pendingRotationAngle = rotationAngle
+        applyPendingRotation(retryIfNeeded: true)
+    }
+
+    private func applyPendingRotation(retryIfNeeded: Bool) {
+        guard let connection = previewLayer.connection else {
+            if retryIfNeeded {
+                scheduleRotationRetry()
+            }
             return
         }
-        connection.videoRotationAngle = rotationAngle
+
+        rotationRetryWorkItem?.cancel()
+        rotationRetryWorkItem = nil
+
+        guard connection.isVideoRotationAngleSupported(pendingRotationAngle) else {
+            return
+        }
+        connection.videoRotationAngle = pendingRotationAngle
+        connection.isVideoMirrored = false
+    }
+
+    private func scheduleRotationRetry() {
+        guard window != nil, rotationRetryWorkItem == nil else {
+            return
+        }
+
+        let workItem = DispatchWorkItem { [weak self] in
+            self?.rotationRetryWorkItem = nil
+            self?.applyPendingRotation(retryIfNeeded: true)
+        }
+        rotationRetryWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(50), execute: workItem)
     }
 }
