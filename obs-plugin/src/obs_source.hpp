@@ -76,6 +76,9 @@ private:
     int formatLogs_ = 0;
     int frameLogs_ = 0;
     int decodeErrorLogs_ = 0;
+    int completedFrameLogs_ = 0;
+    int waitKeyFrameLogs_ = 0;
+    int lastLoggedNetworkDrops_ = 0;
     uint32_t width_ = 1920;
     uint32_t height_ = 1080;
     bool noSignalOutput_ = false;

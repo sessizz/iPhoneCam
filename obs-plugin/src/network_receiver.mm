@@ -68,6 +68,8 @@ struct NetworkReceiver::Impl {
 
         const int yes = 1;
         setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+        const int receiveBufferSize = 4 * 1024 * 1024;
+        setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &receiveBufferSize, sizeof(receiveBufferSize));
         const int no = 0;
         setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &no, sizeof(no));
 

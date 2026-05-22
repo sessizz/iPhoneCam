@@ -68,7 +68,7 @@ IPhoneCamSource::IPhoneCamSource(obs_data_t *settings, obs_source_t *source)
       settings_(readSettings(settings)),
       receiver_(std::make_unique<NetworkReceiver>()),
       decoder_(std::make_unique<VideoDecoder>()),
-      reassembler_(std::chrono::milliseconds(120)),
+      reassembler_(std::chrono::milliseconds(300)),
       lastFrameAt_(std::chrono::steady_clock::now()),
       lastStatsAt_(std::chrono::steady_clock::now())
 {
@@ -189,8 +189,20 @@ void IPhoneCamSource::handleDatagram(const std::vector<uint8_t> &data)
             std::lock_guard<std::mutex> lock(mutex_);
             stats_.networkDroppedFrames = reassembler_.droppedFrameCount();
         }
-        if (frame)
+        const int droppedFrames = reassembler_.droppedFrameCount();
+        if (droppedFrames != lastLoggedNetworkDrops_ && droppedFrames <= 20) {
+            blog(LOG_WARNING, "[iPhoneCam] Reassembler dropped stale frames: %d", droppedFrames);
+            lastLoggedNetworkDrops_ = droppedFrames;
+        }
+        if (frame) {
+            if (completedFrameLogs_ < 10) {
+                blog(LOG_INFO, "[iPhoneCam] Completed frame %llu size=%zu keyframe=%s",
+                     static_cast<unsigned long long>(frame->frameId), frame->data.size(),
+                     frame->isKeyFrame ? "yes" : "no");
+                completedFrameLogs_ += 1;
+            }
             handleFrame(*frame);
+        }
         break;
     }
     }
@@ -235,8 +247,14 @@ void IPhoneCamSource::handleFrame(const EncodedVideoFrame &frame)
 {
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (stats_.waitingForKeyFrame && !frame.isKeyFrame)
+        if (stats_.waitingForKeyFrame && !frame.isKeyFrame) {
+            if (waitKeyFrameLogs_ < 10) {
+                blog(LOG_INFO, "[iPhoneCam] Completed non-keyframe %llu while waiting for keyframe",
+                     static_cast<unsigned long long>(frame.frameId));
+                waitKeyFrameLogs_ += 1;
+            }
             return;
+        }
         stats_.waitingForKeyFrame = false;
         stats_.receivedFrames += 1;
         receivedFramesSinceStats_ += 1;
