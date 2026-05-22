@@ -118,7 +118,17 @@ final class CameraViewModel: ObservableObject {
     }
 
     func updateOrientation() {
-        capture.updateVideoRotation(for: UIDevice.current.orientation)
+        capture.updateVideoRotation(
+            for: UIDevice.current.orientation,
+            interfaceOrientation: currentInterfaceOrientation()
+        )
+    }
+
+    private func currentInterfaceOrientation() -> UIInterfaceOrientation? {
+        UIApplication.shared.connectedScenes
+            .compactMap { $0 as? UIWindowScene }
+            .first { $0.activationState == .foregroundActive }?
+            .interfaceOrientation
     }
 
     private func disableIdleTimer() {

@@ -44,8 +44,8 @@ final class CameraCaptureController: NSObject, ObservableObject, @unchecked Send
         }
     }
 
-    func updateVideoRotation(for orientation: UIDeviceOrientation) {
-        guard let angle = Self.rotationAngle(for: orientation) else {
+    func updateVideoRotation(for deviceOrientation: UIDeviceOrientation, interfaceOrientation: UIInterfaceOrientation?) {
+        guard let angle = Self.rotationAngle(for: interfaceOrientation) ?? Self.rotationAngle(for: deviceOrientation) else {
             return
         }
         currentRotationAngle = angle
@@ -138,6 +138,17 @@ final class CameraCaptureController: NSObject, ObservableObject, @unchecked Send
     }
 
     private static func rotationAngle(for orientation: UIDeviceOrientation) -> CGFloat? {
+        switch orientation {
+        case .landscapeLeft:
+            return 0
+        case .landscapeRight:
+            return 180
+        default:
+            return nil
+        }
+    }
+
+    private static func rotationAngle(for orientation: UIInterfaceOrientation?) -> CGFloat? {
         switch orientation {
         case .landscapeRight:
             return 0
