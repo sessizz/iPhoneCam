@@ -262,6 +262,11 @@ void IPhoneCamSource::handleFrame(const EncodedVideoFrame &frame)
 
     DecodedFrame decoded;
     std::string error;
+    if (decodeAttemptLogs_ < 10) {
+        blog(LOG_INFO, "[iPhoneCam] Decoding frame %llu size=%zu keyframe=%s",
+             static_cast<unsigned long long>(frame.frameId), frame.data.size(), frame.isKeyFrame ? "yes" : "no");
+        decodeAttemptLogs_ += 1;
+    }
     if (!decoder_->decode(frame, decoded, error)) {
         if (decodeErrorLogs_ < 10) {
             blog(LOG_WARNING, "[iPhoneCam] Decode dropped frame %llu: %s",
@@ -286,6 +291,12 @@ void IPhoneCamSource::handleFrame(const EncodedVideoFrame &frame)
 
 void IPhoneCamSource::outputDecodedFrame(const DecodedFrame &frame)
 {
+    if (outputFrameLogs_ < 10) {
+        blog(LOG_INFO, "[iPhoneCam] Output decoded frame %dx%d yStride=%u uvStride=%u", frame.width, frame.height,
+             frame.yStride, frame.uvStride);
+        outputFrameLogs_ += 1;
+    }
+
     obs_source_frame obsFrame = {};
     obsFrame.data[0] = const_cast<uint8_t *>(frame.yPlane.data());
     obsFrame.data[1] = const_cast<uint8_t *>(frame.uvPlane.data());

@@ -186,8 +186,8 @@ bool VideoDecoder::decode(const EncodedVideoFrame &frame, DecodedFrame &decoded,
     DecodeRequest request;
     request.decoded = &decoded;
     decoded.ptsNanos = frame.ptsNanos;
-    status = VTDecompressionSessionDecodeFrame(impl_->session, sampleBuffer, 0, &request, nullptr);
-    VTDecompressionSessionWaitForAsynchronousFrames(impl_->session);
+    status = VTDecompressionSessionDecodeFrame(impl_->session, sampleBuffer, kVTDecodeFrame_1xRealTimePlayback, &request,
+                                               nullptr);
     CFRelease(sampleBuffer);
 
     if (status != noErr) {
