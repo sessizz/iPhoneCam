@@ -60,7 +60,6 @@ private:
     void handleFrame(const EncodedVideoFrame &frame);
     void decodeFrame(const EncodedVideoFrame &frame);
     void resetDecoder();
-    int maxPendingDecodeFrames() const;
     void outputDecodedFrame(const DecodedFrame &frame);
     void outputBlackFrame();
     void updateFpsCounters();

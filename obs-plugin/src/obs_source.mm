@@ -283,15 +283,6 @@ void IPhoneCamSource::handleFrame(const EncodedVideoFrame &frame)
         receivedFramesSinceStats_ += 1;
     }
 
-    if (pendingDecodeFrames_.load() >= maxPendingDecodeFrames() && !frame.isKeyFrame) {
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            stats_.decodeDroppedFrames += 1;
-        }
-        markStatsDirty();
-        return;
-    }
-
     auto *frameCopy = new EncodedVideoFrame(frame);
     pendingDecodeFrames_ += 1;
     dispatch_async(decodeQueue_, ^{
@@ -346,15 +337,6 @@ void IPhoneCamSource::resetDecoder()
     std::lock_guard<std::mutex> decoderLock(decoderMutex_);
     decoder_->reset();
     pendingDecodeFrames_ = 0;
-}
-
-int IPhoneCamSource::maxPendingDecodeFrames() const
-{
-    if (settings_.latencyMs == 0)
-        return 2;
-    if (settings_.latencyMs == 60)
-        return 5;
-    return 8;
 }
 
 void IPhoneCamSource::outputDecodedFrame(const DecodedFrame &frame)
