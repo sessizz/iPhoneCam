@@ -69,12 +69,15 @@ final class CameraViewModel: ObservableObject {
     private let browser = BonjourBrowser()
     private let sender = NetworkVideoSender()
     private var started = false
+    private var idleTimerWasDisabled = false
+    private var idleTimerManaged = false
 
     func start() {
         guard !started else {
             return
         }
         started = true
+        disableIdleTimer()
 
         sender.onStatusChanged = { [weak self] status in
             Task { @MainActor in
@@ -111,9 +114,27 @@ final class CameraViewModel: ObservableObject {
         sender.stop()
         capture.stop()
         started = false
+        restoreIdleTimer()
     }
 
     func updateOrientation() {
         capture.updateVideoRotation(for: UIDevice.current.orientation)
+    }
+
+    private func disableIdleTimer() {
+        guard !idleTimerManaged else {
+            return
+        }
+        idleTimerWasDisabled = UIApplication.shared.isIdleTimerDisabled
+        UIApplication.shared.isIdleTimerDisabled = true
+        idleTimerManaged = true
+    }
+
+    private func restoreIdleTimer() {
+        guard idleTimerManaged else {
+            return
+        }
+        UIApplication.shared.isIdleTimerDisabled = idleTimerWasDisabled
+        idleTimerManaged = false
     }
 }
