@@ -253,9 +253,10 @@ void IPhoneCamSource::handleFormat(const FormatPayload &format)
     }
     markStatsDirty();
 
+    auto formatCopy = std::make_shared<FormatPayload>(format);
     dispatch_async(decodeQueue_, ^{
       std::string error;
-      if (!decoder_->configure(format, error)) {
+      if (!decoder_->configure(*formatCopy, error)) {
           blog(LOG_ERROR, "[iPhoneCam] Decoder configure failed: %s", error.c_str());
           {
               std::lock_guard<std::mutex> lock(mutex_);
@@ -284,9 +285,10 @@ void IPhoneCamSource::handleFrame(const EncodedVideoFrame &frame)
         receivedFramesSinceStats_ += 1;
     }
 
+    auto frameCopy = std::make_shared<EncodedVideoFrame>(frame);
     pendingDecodeFrames_ += 1;
     dispatch_async(decodeQueue_, ^{
-      decodeFrame(frame);
+      decodeFrame(*frameCopy);
       pendingDecodeFrames_ -= 1;
     });
 }
