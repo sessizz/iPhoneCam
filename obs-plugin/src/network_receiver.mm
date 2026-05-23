@@ -4,6 +4,7 @@
 #include <util/base.h>
 
 #include <array>
+#include <chrono>
 #include <cerrno>
 #include <cstring>
 #include <dns_sd.h>
@@ -19,6 +20,8 @@
 
 namespace iphonecam {
 namespace {
+
+constexpr auto kEndpointTimeout = std::chrono::milliseconds(1500);
 
 std::string endpointDescription(const sockaddr_storage &address, socklen_t addressLength)
 {
@@ -41,10 +44,12 @@ std::string errnoDescription(const char *operation)
 struct NetworkReceiver::Impl {
     dispatch_queue_t queue = dispatch_queue_create("iphonecam.obs.receiver", DISPATCH_QUEUE_SERIAL);
     dispatch_source_t readSource = nullptr;
+    dispatch_source_t timeoutSource = nullptr;
     DNSServiceRef bonjourService = nullptr;
     int socketFd = -1;
     uint16_t port = 0;
     std::string activeEndpoint;
+    std::chrono::steady_clock::time_point lastPacketAt;
     PacketCallback onPacket;
     StatusCallback onStatus;
 
@@ -118,6 +123,7 @@ struct NetworkReceiver::Impl {
           close(sourceFd);
         });
         dispatch_resume(readSource);
+        startTimeoutTimer();
 
         blog(LOG_INFO, "[iPhoneCam] OBS UDP receiver listening as '%s' on port %u", receiverName.c_str(), port);
         publishStatus("Waiting for iPhone", port);
@@ -125,6 +131,10 @@ struct NetworkReceiver::Impl {
 
     void stop()
     {
+        if (timeoutSource) {
+            dispatch_source_cancel(timeoutSource);
+            timeoutSource = nullptr;
+        }
         if (readSource) {
             dispatch_source_cancel(readSource);
             readSource = nullptr;
@@ -139,6 +149,7 @@ struct NetworkReceiver::Impl {
         }
         port = 0;
         activeEndpoint.clear();
+        lastPacketAt = {};
     }
 
     bool publishBonjour(const std::string &receiverName, uint16_t servicePort)
@@ -183,19 +194,57 @@ struct NetworkReceiver::Impl {
                 continue;
 
             const std::string endpoint = endpointDescription(sender, senderLength);
+            const auto now = std::chrono::steady_clock::now();
             if (activeEndpoint.empty()) {
                 activeEndpoint = endpoint;
+                lastPacketAt = now;
                 blog(LOG_INFO, "[iPhoneCam] OBS receiver accepted iPhone endpoint %s", activeEndpoint.c_str());
                 publishStatus("Connected: " + activeEndpoint, port);
             } else if (endpoint != activeEndpoint) {
-                blog(LOG_INFO, "[iPhoneCam] OBS receiver ignored second endpoint %s", endpoint.c_str());
-                continue;
+                if (now - lastPacketAt > kEndpointTimeout) {
+                    blog(LOG_INFO, "[iPhoneCam] OBS receiver accepted reconnect endpoint %s (previous %s)",
+                         endpoint.c_str(), activeEndpoint.c_str());
+                    activeEndpoint = endpoint;
+                    lastPacketAt = now;
+                    publishStatus("Connected: " + activeEndpoint, port);
+                } else {
+                    blog(LOG_INFO, "[iPhoneCam] OBS receiver ignored second endpoint %s", endpoint.c_str());
+                    continue;
+                }
+            } else {
+                lastPacketAt = now;
             }
 
             if (onPacket) {
                 onPacket(std::vector<uint8_t>(buffer.begin(), buffer.begin() + bytesRead));
             }
         }
+    }
+
+    void startTimeoutTimer()
+    {
+        timeoutSource = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, queue);
+        dispatch_source_set_timer(timeoutSource, dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_MSEC * 500),
+                                  NSEC_PER_MSEC * 500, NSEC_PER_MSEC * 100);
+        dispatch_source_set_event_handler(timeoutSource, ^{
+          checkEndpointTimeout();
+        });
+        dispatch_resume(timeoutSource);
+    }
+
+    void checkEndpointTimeout()
+    {
+        if (activeEndpoint.empty() || lastPacketAt.time_since_epoch().count() == 0)
+            return;
+
+        const auto now = std::chrono::steady_clock::now();
+        if (now - lastPacketAt <= kEndpointTimeout)
+            return;
+
+        blog(LOG_INFO, "[iPhoneCam] OBS receiver endpoint timed out: %s", activeEndpoint.c_str());
+        activeEndpoint.clear();
+        lastPacketAt = {};
+        publishStatus("Waiting for iPhone", port);
     }
 
     void fail(const std::string &message)

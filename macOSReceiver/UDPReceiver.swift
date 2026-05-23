@@ -8,6 +8,9 @@ final class UDPReceiver: @unchecked Sendable {
     private let queue = DispatchQueue(label: "iphonecam.receiver.udp")
     private var listener: NWListener?
     private var connections: [ObjectIdentifier: NWConnection] = [:]
+    private var timeoutTimer: DispatchSourceTimer?
+    private var hasActiveSender = false
+    private var lastPacketAt: Date?
 
     func start() {
         queue.async { [weak self] in
@@ -36,14 +39,19 @@ final class UDPReceiver: @unchecked Sendable {
         queue.async { [weak self] in
             self?.listener?.cancel()
             self?.listener = nil
+            self?.timeoutTimer?.cancel()
+            self?.timeoutTimer = nil
             self?.connections.values.forEach { $0.cancel() }
             self?.connections.removeAll()
+            self?.hasActiveSender = false
+            self?.lastPacketAt = nil
         }
     }
 
     private func handleState(_ state: NWListener.State) {
         switch state {
         case .ready:
+            startTimeoutTimer()
             if let port = listener?.port {
                 onStatusChanged?("Waiting for iPhone on UDP \(port.rawValue)")
             } else {
@@ -77,11 +85,36 @@ final class UDPReceiver: @unchecked Sendable {
         connection.receiveMessage { [weak self, weak connection] data, _, _, error in
             guard let self, let connection else { return }
             if let data, let packet = CameraPacket(data: data) {
+                self.hasActiveSender = true
+                self.lastPacketAt = Date()
                 self.onPacket?(packet)
             }
             if error == nil {
                 self.receive(on: connection)
             }
         }
+    }
+
+    private func startTimeoutTimer() {
+        timeoutTimer?.cancel()
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now() + 0.5, repeating: 0.5)
+        timer.setEventHandler { [weak self] in
+            self?.checkSenderTimeout()
+        }
+        timeoutTimer = timer
+        timer.resume()
+    }
+
+    private func checkSenderTimeout() {
+        guard hasActiveSender, let lastPacketAt else {
+            return
+        }
+        guard Date().timeIntervalSince(lastPacketAt) > 1.5 else {
+            return
+        }
+        hasActiveSender = false
+        self.lastPacketAt = nil
+        onStatusChanged?("Waiting for iPhone")
     }
 }
