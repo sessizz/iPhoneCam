@@ -13,7 +13,7 @@ struct ContentView: View {
                 Color.black
                     .ignoresSafeArea()
 
-                CameraPreview(session: model.capture.session, rotationAngle: model.capture.videoRotationAngle)
+                CameraPreview(renderer: model.previewRenderer)
                     .ignoresSafeArea()
 
                 controlOverlay(size: proxy.size, compact: compact)
@@ -86,7 +86,12 @@ struct ContentView: View {
                     Divider()
                         .overlay(.white.opacity(0.18))
                     Text(model.capture.activeFormatText)
+                    Text(model.capture.stabilizationModeText)
                     Text(model.capture.cameraModeText)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.65)
+                    Text(model.capture.activeLensText)
+                    Text(model.capture.lensSwitchingText)
                         .lineLimit(1)
                         .minimumScaleFactor(0.65)
                     Text(model.senderStats)
@@ -152,6 +157,13 @@ struct ContentView: View {
                 .font(.title3.monospacedDigit().weight(.semibold))
                 .frame(width: 74)
 
+            Text(model.activeLensBadgeText)
+                .font(.caption2.weight(.semibold))
+                .lineLimit(2)
+                .multilineTextAlignment(.center)
+                .minimumScaleFactor(0.65)
+                .frame(width: 74, height: 34)
+
             ZoomJogControl(
                 zoomFactor: model.capture.zoomFactor,
                 minZoomFactor: model.capture.minZoomFactor,
@@ -177,6 +189,7 @@ final class CameraViewModel: ObservableObject {
     @Published var presetRampDuration = 1.2
 
     let capture = CameraCaptureController()
+    let previewRenderer = CameraPreviewRenderer()
     let zoomPresets: [CGFloat] = [0.5, 1, 2, 4, 8]
 
     private let browser = BonjourBrowser()
@@ -217,6 +230,9 @@ final class CameraViewModel: ObservableObject {
         }
         capture.onEncodedSample = { [weak self] sample in
             self?.sender.send(sample)
+        }
+        capture.onPreviewSample = { [weak self] sampleBuffer in
+            self?.previewRenderer.display(sampleBuffer)
         }
 
         browser.start()
@@ -268,6 +284,10 @@ final class CameraViewModel: ObservableObject {
 
     func zoomLabel(for factor: CGFloat) -> String {
         factor < 1 ? String(format: "%.1fx", factor) : "\(Int(factor))x"
+    }
+
+    var activeLensBadgeText: String {
+        capture.activeLensText.replacingOccurrences(of: "Lens: ", with: "")
     }
 
     private func currentInterfaceOrientation() -> UIInterfaceOrientation? {

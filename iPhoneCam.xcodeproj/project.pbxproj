@@ -16,7 +16,6 @@
 		300000000000000000000007 /* H264Encoder.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000007 /* H264Encoder.swift */; };
 		300000000000000000000008 /* BonjourBrowser.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000008 /* BonjourBrowser.swift */; };
 		300000000000000000000009 /* NetworkVideoSender.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000009 /* NetworkVideoSender.swift */; };
-		300000000000000000000022 /* LaunchScreen.storyboard in Resources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000021 /* LaunchScreen.storyboard */; };
 		300000000000000000000010 /* Packet.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000001 /* Packet.swift */; };
 		300000000000000000000011 /* FrameReassembler.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000002 /* FrameReassembler.swift */; };
 		300000000000000000000012 /* macOSReceiverApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000011 /* macOSReceiverApp.swift */; };
@@ -25,10 +24,12 @@
 		300000000000000000000015 /* ReceiverViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000014 /* ReceiverViewModel.swift */; };
 		300000000000000000000016 /* UDPReceiver.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000015 /* UDPReceiver.swift */; };
 		300000000000000000000017 /* H264SampleBuilder.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000016 /* H264SampleBuilder.swift */; };
-		300000000000000000000021 /* ReceiverPacketProcessor.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000020 /* ReceiverPacketProcessor.swift */; };
 		300000000000000000000018 /* Packet.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000001 /* Packet.swift */; };
 		300000000000000000000019 /* FrameReassembler.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000002 /* FrameReassembler.swift */; };
-		300000000000000000000020 /* SharedProtocolTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000019 /* SharedProtocolTests.swift */; };
+			300000000000000000000020 /* SharedProtocolTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000019 /* SharedProtocolTests.swift */; };
+			300000000000000000000021 /* ReceiverPacketProcessor.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000020 /* ReceiverPacketProcessor.swift */; };
+			300000000000000000000022 /* LaunchScreen.storyboard in Resources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000021 /* LaunchScreen.storyboard */; };
+			300000000000000000000023 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000022 /* Assets.xcassets */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -45,17 +46,18 @@
 		200000000000000000000008 /* BonjourBrowser.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BonjourBrowser.swift; sourceTree = "<group>"; };
 		200000000000000000000009 /* NetworkVideoSender.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NetworkVideoSender.swift; sourceTree = "<group>"; };
 		200000000000000000000010 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
-		200000000000000000000021 /* LaunchScreen.storyboard */ = {isa = PBXFileReference; lastKnownFileType = file.storyboard; path = LaunchScreen.storyboard; sourceTree = "<group>"; };
 		200000000000000000000011 /* macOSReceiverApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = macOSReceiverApp.swift; sourceTree = "<group>"; };
 		200000000000000000000012 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
 		200000000000000000000013 /* SampleBufferDisplayView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SampleBufferDisplayView.swift; sourceTree = "<group>"; };
 		200000000000000000000014 /* ReceiverViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReceiverViewModel.swift; sourceTree = "<group>"; };
 		200000000000000000000015 /* UDPReceiver.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UDPReceiver.swift; sourceTree = "<group>"; };
 		200000000000000000000016 /* H264SampleBuilder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = H264SampleBuilder.swift; sourceTree = "<group>"; };
-		200000000000000000000020 /* ReceiverPacketProcessor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReceiverPacketProcessor.swift; sourceTree = "<group>"; };
 		200000000000000000000017 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		200000000000000000000018 /* macOSReceiver.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = macOSReceiver.entitlements; sourceTree = "<group>"; };
 		200000000000000000000019 /* SharedProtocolTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SharedProtocolTests.swift; sourceTree = "<group>"; };
+			200000000000000000000020 /* ReceiverPacketProcessor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReceiverPacketProcessor.swift; sourceTree = "<group>"; };
+			200000000000000000000021 /* LaunchScreen.storyboard */ = {isa = PBXFileReference; lastKnownFileType = file.storyboard; path = LaunchScreen.storyboard; sourceTree = "<group>"; };
+			200000000000000000000022 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -122,9 +124,10 @@
 				200000000000000000000006 /* CameraCaptureController.swift */,
 				200000000000000000000007 /* H264Encoder.swift */,
 				200000000000000000000008 /* BonjourBrowser.swift */,
-				200000000000000000000009 /* NetworkVideoSender.swift */,
-				200000000000000000000010 /* Info.plist */,
-				200000000000000000000021 /* LaunchScreen.storyboard */,
+					200000000000000000000009 /* NetworkVideoSender.swift */,
+					200000000000000000000010 /* Info.plist */,
+					200000000000000000000022 /* Assets.xcassets */,
+					200000000000000000000021 /* LaunchScreen.storyboard */,
 			);
 			path = iOSCamera;
 			sourceTree = "<group>";
@@ -215,7 +218,7 @@
 			attributes = {
 				BuildIndependentTargetsInParallel = 1;
 				LastSwiftUpdateCheck = 2600;
-				LastUpgradeCheck = 2600;
+				LastUpgradeCheck = 2650;
 				TargetAttributes = {
 					100000000000000000000001 = {
 						CreatedOnToolsVersion = 26.5;
@@ -252,9 +255,10 @@
 		120000000000000000000003 /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
-			files = (
-				300000000000000000000022 /* LaunchScreen.storyboard in Resources */,
-			);
+				files = (
+					300000000000000000000022 /* LaunchScreen.storyboard in Resources */,
+					300000000000000000000023 /* Assets.xcassets in Resources */,
+				);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 		120000000000000000000006 /* Resources */ = {
@@ -352,6 +356,7 @@
 				CLANG_WARN_UNREACHABLE_CODE = YES;
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
 				COPY_PHASE_STRIP = NO;
+				DEAD_CODE_STRIPPING = YES;
 				DEBUG_INFORMATION_FORMAT = dwarf;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
 				ENABLE_TESTABILITY = YES;
@@ -374,6 +379,7 @@
 				MTL_FAST_MATH = YES;
 				ONLY_ACTIVE_ARCH = YES;
 				SDKROOT = auto;
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
 				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
 				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
 				SWIFT_STRICT_CONCURRENCY = minimal;
@@ -382,8 +388,9 @@
 		};
 		400000000000000000000004 /* Debug */ = {
 			isa = XCBuildConfiguration;
-			buildSettings = {
-				CODE_SIGN_STYLE = Automatic;
+				buildSettings = {
+					ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+					CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_LANGUAGE = en;
 				DEVELOPMENT_TEAM = TW9F922D62;
@@ -407,8 +414,9 @@
 		};
 		400000000000000000000005 /* Release */ = {
 			isa = XCBuildConfiguration;
-			buildSettings = {
-				CODE_SIGN_STYLE = Automatic;
+				buildSettings = {
+					ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+					CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_LANGUAGE = en;
 				DEVELOPMENT_TEAM = TW9F922D62;
@@ -438,6 +446,7 @@
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 1;
+				DEAD_CODE_STRIPPING = YES;
 				DEVELOPMENT_LANGUAGE = en;
 				ENABLE_HARDENED_RUNTIME = YES;
 				GENERATE_INFOPLIST_FILE = NO;
@@ -463,6 +472,7 @@
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 1;
+				DEAD_CODE_STRIPPING = YES;
 				DEVELOPMENT_LANGUAGE = en;
 				ENABLE_HARDENED_RUNTIME = YES;
 				GENERATE_INFOPLIST_FILE = NO;
@@ -486,6 +496,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				CODE_SIGN_STYLE = Automatic;
+				DEAD_CODE_STRIPPING = YES;
 				GENERATE_INFOPLIST_FILE = YES;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
@@ -505,6 +516,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				CODE_SIGN_STYLE = Automatic;
+				DEAD_CODE_STRIPPING = YES;
 				GENERATE_INFOPLIST_FILE = YES;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
@@ -554,6 +566,7 @@
 				CLANG_WARN_UNREACHABLE_CODE = YES;
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
 				COPY_PHASE_STRIP = NO;
+				DEAD_CODE_STRIPPING = YES;
 				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
 				ENABLE_NS_ASSERTIONS = NO;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
@@ -569,6 +582,7 @@
 				MTL_ENABLE_DEBUG_INFO = NO;
 				MTL_FAST_MATH = YES;
 				SDKROOT = auto;
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
 				SWIFT_COMPILATION_MODE = wholemodule;
 				SWIFT_OPTIMIZATION_LEVEL = "-O";
 				SWIFT_STRICT_CONCURRENCY = minimal;

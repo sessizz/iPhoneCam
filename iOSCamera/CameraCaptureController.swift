@@ -12,11 +12,15 @@ final class CameraCaptureController: NSObject, ObservableObject, @unchecked Send
     @Published private(set) var maxZoomFactor: CGFloat = 1
     @Published private(set) var switchOverZoomFactors: [CGFloat] = []
     @Published private(set) var cameraModeText = "Back camera"
+    @Published private(set) var activeLensText = "Lens: -"
+    @Published private(set) var lensSwitchingText = "Lens switching: -"
+    @Published private(set) var stabilizationModeText = "Stabilization: standard requested"
 
     let session = AVCaptureSession()
 
     var onFormat: ((H264Format) -> Void)?
     var onEncodedSample: ((EncodedH264Sample) -> Void)?
+    var onPreviewSample: ((CMSampleBuffer) -> Void)?
 
     private let sessionQueue = DispatchQueue(label: "iphonecam.capture.session")
     private var videoOutput: AVCaptureVideoDataOutput?
@@ -28,6 +32,7 @@ final class CameraCaptureController: NSObject, ObservableObject, @unchecked Send
     private var displayZoomFactorMultiplier: CGFloat = 1
     private var lastContinuousZoomIntensity: Double = 0
     private var lastContinuousZoomCommand = Date.distantPast
+    private var lastStabilizationModePublish = Date.distantPast
     private let maximumPresentedZoomFactor: CGFloat = 8
 
     func start() {
@@ -230,9 +235,59 @@ final class CameraCaptureController: NSObject, ObservableObject, @unchecked Send
 
     private func applyVideoStabilization(on connection: AVCaptureConnection) {
         guard connection.isVideoStabilizationSupported else {
+            publishStabilizationMode("Stabilization: unsupported")
             return
         }
         connection.preferredVideoStabilizationMode = .standard
+        publishStabilizationMode(for: connection)
+    }
+
+    private func publishStabilizationModeIfNeeded(for connection: AVCaptureConnection) {
+        let now = Date()
+        guard now.timeIntervalSince(lastStabilizationModePublish) >= 1 else {
+            return
+        }
+        lastStabilizationModePublish = now
+        publishStabilizationMode(for: connection)
+    }
+
+    private func publishStabilizationMode(for connection: AVCaptureConnection) {
+        guard connection.isVideoStabilizationSupported else {
+            publishStabilizationMode("Stabilization: unsupported")
+            return
+        }
+        let active = Self.stabilizationModeName(connection.activeVideoStabilizationMode)
+        let preferred = Self.stabilizationModeName(connection.preferredVideoStabilizationMode)
+        publishStabilizationMode("Stabilization: \(active) active, \(preferred) preferred")
+    }
+
+    private func publishStabilizationMode(_ text: String) {
+        DispatchQueue.main.async { [weak self] in
+            self?.stabilizationModeText = text
+        }
+    }
+
+    private static func stabilizationModeName(_ mode: AVCaptureVideoStabilizationMode) -> String {
+        switch mode {
+        case .off:
+            return "off"
+        case .standard:
+            return "standard"
+        case .cinematic:
+            return "cinematic"
+        case .cinematicExtended:
+            return "cinematic extended"
+        case .previewOptimized:
+            return "preview optimized"
+        case .cinematicExtendedEnhanced:
+            return "cinematic extended enhanced"
+        case .lowLatency:
+            return "low latency"
+        case .auto:
+            return "auto"
+        @unknown default:
+            return "unknown"
+        }
     }
 
     private static func rotationAngle(for orientation: UIDeviceOrientation) -> CGFloat? {
@@ -353,6 +408,8 @@ final class CameraCaptureController: NSObject, ObservableObject, @unchecked Send
             .map { displayedZoomFactor(forDeviceZoomFactor: CGFloat(truncating: $0)) }
             .filter { $0 >= minimum && $0 <= maximum }
         let cameraText = device.isVirtualDevice ? "Virtual camera: \(device.localizedName)" : "Single camera: \(device.localizedName)"
+        let activeLensText = activeLensText(for: device)
+        let lensSwitchingText = lensSwitchingText(for: device, switchOvers: switchOvers)
         let virtualWarning = device.isVirtualDevice ? nil : "Virtual camera unavailable; lens switching disabled."
         let warnings = [selectedFormat.warning, virtualWarning].compactMap { $0 }
         let currentZoom = displayedZoomFactor(forDeviceZoomFactor: device.videoZoomFactor)
@@ -363,6 +420,8 @@ final class CameraCaptureController: NSObject, ObservableObject, @unchecked Send
             self?.switchOverZoomFactors = switchOvers
             self?.zoomFactor = currentZoom
             self?.cameraModeText = cameraText
+            self?.activeLensText = activeLensText
+            self?.lensSwitchingText = lensSwitchingText
             self?.warningText = warnings.isEmpty ? nil : warnings.joined(separator: " ")
         }
     }
@@ -388,8 +447,65 @@ final class CameraCaptureController: NSObject, ObservableObject, @unchecked Send
 
     private func publishZoom(_ zoomFactor: CGFloat) {
         let displayedZoomFactor = displayedZoomFactor(forDeviceZoomFactor: zoomFactor)
+        let currentActiveLensText = captureDevice.map { activeLensText(for: $0) } ?? "Lens: -"
         DispatchQueue.main.async { [weak self] in
             self?.zoomFactor = displayedZoomFactor
+            self?.activeLensText = currentActiveLensText
+        }
+    }
+
+    private func activeLensText(for device: AVCaptureDevice) -> String {
+        guard device.isVirtualDevice else {
+            return "Lens: \(Self.lensName(for: device))"
+        }
+        guard let activeDevice = device.activePrimaryConstituent else {
+            return "Lens: selecting"
+        }
+        return "Lens: \(Self.lensName(for: activeDevice))"
+    }
+
+    private func lensSwitchingText(for device: AVCaptureDevice, switchOvers: [CGFloat]) -> String {
+        guard device.isVirtualDevice else {
+            return "Lens switching: unavailable"
+        }
+        let behavior = Self.switchingBehaviorName(device.activePrimaryConstituentDeviceSwitchingBehavior)
+        let thresholds = switchOvers.isEmpty
+            ? "no thresholds"
+            : switchOvers.map { String(format: "%.1fx", $0) }.joined(separator: ", ")
+        return "Lens switching: \(behavior), \(thresholds)"
+    }
+
+    private static func lensName(for device: AVCaptureDevice) -> String {
+        switch device.deviceType {
+        case .builtInUltraWideCamera:
+            return "Ultra Wide"
+        case .builtInWideAngleCamera:
+            return "Wide"
+        case .builtInTelephotoCamera:
+            return "Tele"
+        case .builtInDualCamera:
+            return "Dual"
+        case .builtInDualWideCamera:
+            return "Dual Wide"
+        case .builtInTripleCamera:
+            return "Triple"
+        default:
+            return device.localizedName
+        }
+    }
+
+    private static func switchingBehaviorName(_ behavior: AVCaptureDevice.PrimaryConstituentDeviceSwitchingBehavior) -> String {
+        switch behavior {
+        case .unsupported:
+            return "unsupported"
+        case .auto:
+            return "auto"
+        case .restricted:
+            return "restricted"
+        case .locked:
+            return "locked"
+        @unknown default:
+            return "unknown"
         }
     }
 
@@ -448,6 +564,8 @@ final class CameraCaptureController: NSObject, ObservableObject, @unchecked Send
 extension CameraCaptureController: AVCaptureVideoDataOutputSampleBufferDelegate {
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
         encoder?.encode(sampleBuffer)
+        onPreviewSample?(sampleBuffer)
+        publishStabilizationModeIfNeeded(for: connection)
     }
 }
 
