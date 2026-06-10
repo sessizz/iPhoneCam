@@ -37,6 +37,8 @@ final class ReceiverPacketProcessor: @unchecked Sendable {
             if let frame = reassembler.accept(packet) {
                 onFrame?(frame, reassembler.droppedFrameCount)
             }
+        case .control:
+            break
         }
     }
 }

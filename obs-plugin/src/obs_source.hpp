@@ -11,6 +11,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <vector>
 
 #include <dispatch/dispatch.h>
 
@@ -51,10 +52,15 @@ public:
     uint32_t width() const;
     uint32_t height() const;
     SourceStats stats() const;
+    void handleZoomHotkey(ControlAction action, ControlSpeed speed, bool pressed);
+    void handleResetZoomHotkey(bool pressed);
 
 private:
     void startReceiver();
     void stopReceiver();
+    void registerHotkeys();
+    void unregisterHotkeys();
+    void sendControlCommand(const ControlCommand &command);
     void handleDatagram(const std::vector<uint8_t> &data);
     void handleHello(const HelloPayload &hello);
     void handleFormat(const FormatPayload &format);
@@ -75,6 +81,7 @@ private:
     SourceStats stats_;
     std::unique_ptr<NetworkReceiver> receiver_;
     std::unique_ptr<VideoDecoder> decoder_;
+    std::vector<size_t> hotkeyIds_;
     std::optional<FormatPayload> lastFormat_;
     std::mutex decoderMutex_;
     dispatch_queue_t decodeQueue_ = dispatch_queue_create("iphonecam.obs.decode", DISPATCH_QUEUE_SERIAL);

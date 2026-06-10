@@ -4,6 +4,7 @@ public enum CameraPacketKind: UInt8, Sendable {
     case hello = 1
     case format = 2
     case frameFragment = 3
+    case control = 4
 }
 
 public struct CameraPacketFlags: OptionSet, Sendable {
@@ -143,6 +144,29 @@ public struct FormatPayload: Codable, Equatable, Sendable {
         self.bitrate = bitrate
         self.sps = sps
         self.pps = pps
+    }
+}
+
+public enum CameraControlAction: String, Codable, Equatable, Sendable {
+    case zoomIn
+    case zoomOut
+    case stopZoom
+    case resetZoom
+}
+
+public enum CameraControlSpeed: String, Codable, Equatable, Sendable {
+    case slow
+    case medium
+    case fast
+}
+
+public struct CameraControlPayload: Codable, Equatable, Sendable {
+    public let action: CameraControlAction
+    public let speed: CameraControlSpeed?
+
+    public init(action: CameraControlAction, speed: CameraControlSpeed? = nil) {
+        self.action = action
+        self.speed = speed
     }
 }
 

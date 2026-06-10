@@ -49,6 +49,8 @@ struct NetworkReceiver::Impl {
     int socketFd = -1;
     uint16_t port = 0;
     std::string activeEndpoint;
+    sockaddr_storage activeAddress = {};
+    socklen_t activeAddressLength = 0;
     std::chrono::steady_clock::time_point lastPacketAt;
     PacketCallback onPacket;
     StatusCallback onStatus;
@@ -149,7 +151,33 @@ struct NetworkReceiver::Impl {
         }
         port = 0;
         activeEndpoint.clear();
+        activeAddress = {};
+        activeAddressLength = 0;
         lastPacketAt = {};
+    }
+
+    void sendControlCommand(const ControlCommand &command)
+    {
+        const ControlCommand commandCopy = command;
+        dispatch_async(queue, ^{
+          if (socketFd < 0 || activeEndpoint.empty() || activeAddressLength == 0) {
+              blog(LOG_WARNING, "[iPhoneCam] Cannot send control command before an iPhone endpoint is connected");
+              return;
+          }
+
+          CameraPacket packet;
+          packet.kind = PacketKind::Control;
+          packet.streamId = 1;
+          packet.payload = encodeControlPayload(commandCopy);
+          const auto encoded = encodePacket(packet);
+          const ssize_t sent =
+              sendto(socketFd, encoded.data(), encoded.size(), 0, reinterpret_cast<const sockaddr *>(&activeAddress),
+                     activeAddressLength);
+          if (sent < 0) {
+              blog(LOG_WARNING, "[iPhoneCam] Failed to send control command to %s: %s", activeEndpoint.c_str(),
+                   std::strerror(errno));
+          }
+        });
     }
 
     bool publishBonjour(const std::string &receiverName, uint16_t servicePort)
@@ -197,6 +225,8 @@ struct NetworkReceiver::Impl {
             const auto now = std::chrono::steady_clock::now();
             if (activeEndpoint.empty()) {
                 activeEndpoint = endpoint;
+                activeAddress = sender;
+                activeAddressLength = senderLength;
                 lastPacketAt = now;
                 blog(LOG_INFO, "[iPhoneCam] OBS receiver accepted iPhone endpoint %s", activeEndpoint.c_str());
                 publishStatus("Connected: " + activeEndpoint, port);
@@ -205,6 +235,8 @@ struct NetworkReceiver::Impl {
                     blog(LOG_INFO, "[iPhoneCam] OBS receiver accepted reconnect endpoint %s (previous %s)",
                          endpoint.c_str(), activeEndpoint.c_str());
                     activeEndpoint = endpoint;
+                    activeAddress = sender;
+                    activeAddressLength = senderLength;
                     lastPacketAt = now;
                     publishStatus("Connected: " + activeEndpoint, port);
                 } else {
@@ -243,6 +275,8 @@ struct NetworkReceiver::Impl {
 
         blog(LOG_INFO, "[iPhoneCam] OBS receiver endpoint timed out: %s", activeEndpoint.c_str());
         activeEndpoint.clear();
+        activeAddress = {};
+        activeAddressLength = 0;
         lastPacketAt = {};
         publishStatus("Waiting for iPhone", port);
     }
@@ -279,6 +313,11 @@ void NetworkReceiver::start(const std::string &receiverName)
 void NetworkReceiver::stop()
 {
     impl_->stop();
+}
+
+void NetworkReceiver::sendControlCommand(const ControlCommand &command)
+{
+    impl_->sendControlCommand(command);
 }
 
 } // namespace iphonecam

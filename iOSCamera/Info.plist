@@ -30,6 +30,8 @@
 	</array>
 	<key>NSCameraUsageDescription</key>
 	<string>iPhone kamerasını Mac uygulamasına düşük gecikmeli göndermek için kamera erişimi gerekir.</string>
+	<key>NSBluetoothAlwaysUsageDescription</key>
+	<string>ESP32 joystick ile kamera zoom hızını kontrol etmek için Bluetooth kullanılır.</string>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>iPhone kamerasını Mac uygulamasına düşük gecikmeli göndermek için yerel ağ kullanılır.</string>
 	<key>UIApplicationSceneManifest</key>

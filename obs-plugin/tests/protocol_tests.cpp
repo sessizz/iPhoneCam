@@ -39,6 +39,37 @@ void testPacketRoundTrip()
     assert(parsed->payload == packet.payload);
 }
 
+void testControlPacket()
+{
+    ControlCommand command;
+    command.action = ControlAction::ZoomOut;
+    command.speed = ControlSpeed::Fast;
+
+    CameraPacket packet;
+    packet.kind = PacketKind::Control;
+    packet.streamId = 1;
+    packet.payload = encodeControlPayload(command);
+
+    const std::string json(packet.payload.begin(), packet.payload.end());
+    assert(json == R"({"action":"zoomOut","speed":"fast"})");
+
+    const auto encoded = encodePacket(packet);
+    auto parsed = parsePacket(encoded.data(), encoded.size());
+    assert(parsed.has_value());
+    assert(parsed->kind == PacketKind::Control);
+}
+
+void testResetControlPayloadOmitsSpeed()
+{
+    ControlCommand command;
+    command.action = ControlAction::ResetZoom;
+    command.speed = ControlSpeed::Slow;
+
+    const auto payload = encodeControlPayload(command);
+    const std::string json(payload.begin(), payload.end());
+    assert(json == R"({"action":"resetZoom"})");
+}
+
 void testFrameReassembly()
 {
     FrameReassembler reassembler(std::chrono::milliseconds(120));
@@ -117,6 +148,8 @@ void testJsonPayloads()
 int main()
 {
     testPacketRoundTrip();
+    testControlPacket();
+    testResetControlPayloadOmitsSpeed();
     testFrameReassembly();
     testStaleDrop();
     testJsonPayloads();

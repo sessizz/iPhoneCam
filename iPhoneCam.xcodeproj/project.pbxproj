@@ -26,10 +26,14 @@
 		300000000000000000000017 /* H264SampleBuilder.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000016 /* H264SampleBuilder.swift */; };
 		300000000000000000000018 /* Packet.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000001 /* Packet.swift */; };
 		300000000000000000000019 /* FrameReassembler.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000002 /* FrameReassembler.swift */; };
-			300000000000000000000020 /* SharedProtocolTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000019 /* SharedProtocolTests.swift */; };
-			300000000000000000000021 /* ReceiverPacketProcessor.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000020 /* ReceiverPacketProcessor.swift */; };
-			300000000000000000000022 /* LaunchScreen.storyboard in Resources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000021 /* LaunchScreen.storyboard */; };
-			300000000000000000000023 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000022 /* Assets.xcassets */; };
+		300000000000000000000020 /* SharedProtocolTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000019 /* SharedProtocolTests.swift */; };
+		300000000000000000000021 /* ReceiverPacketProcessor.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000020 /* ReceiverPacketProcessor.swift */; };
+		300000000000000000000022 /* LaunchScreen.storyboard in Resources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000021 /* LaunchScreen.storyboard */; };
+		300000000000000000000023 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000022 /* Assets.xcassets */; };
+		300000000000000000000024 /* BLEZoomProtocol.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000023 /* BLEZoomProtocol.swift */; };
+		300000000000000000000025 /* BLEJoystickController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000024 /* BLEJoystickController.swift */; };
+		300000000000000000000026 /* BLEZoomProtocol.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000023 /* BLEZoomProtocol.swift */; };
+		300000000000000000000027 /* AppIcon.icns in Resources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000025 /* AppIcon.icns */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -55,9 +59,12 @@
 		200000000000000000000017 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		200000000000000000000018 /* macOSReceiver.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = macOSReceiver.entitlements; sourceTree = "<group>"; };
 		200000000000000000000019 /* SharedProtocolTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SharedProtocolTests.swift; sourceTree = "<group>"; };
-			200000000000000000000020 /* ReceiverPacketProcessor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReceiverPacketProcessor.swift; sourceTree = "<group>"; };
-			200000000000000000000021 /* LaunchScreen.storyboard */ = {isa = PBXFileReference; lastKnownFileType = file.storyboard; path = LaunchScreen.storyboard; sourceTree = "<group>"; };
-			200000000000000000000022 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		200000000000000000000020 /* ReceiverPacketProcessor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReceiverPacketProcessor.swift; sourceTree = "<group>"; };
+		200000000000000000000021 /* LaunchScreen.storyboard */ = {isa = PBXFileReference; lastKnownFileType = file.storyboard; path = LaunchScreen.storyboard; sourceTree = "<group>"; };
+		200000000000000000000022 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		200000000000000000000023 /* BLEZoomProtocol.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BLEZoomProtocol.swift; sourceTree = "<group>"; };
+		200000000000000000000024 /* BLEJoystickController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BLEJoystickController.swift; sourceTree = "<group>"; };
+		200000000000000000000025 /* AppIcon.icns */ = {isa = PBXFileReference; lastKnownFileType = image.icns; path = AppIcon.icns; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -111,6 +118,7 @@
 			children = (
 				200000000000000000000001 /* Packet.swift */,
 				200000000000000000000002 /* FrameReassembler.swift */,
+				200000000000000000000023 /* BLEZoomProtocol.swift */,
 			);
 			path = Shared;
 			sourceTree = "<group>";
@@ -124,10 +132,11 @@
 				200000000000000000000006 /* CameraCaptureController.swift */,
 				200000000000000000000007 /* H264Encoder.swift */,
 				200000000000000000000008 /* BonjourBrowser.swift */,
-					200000000000000000000009 /* NetworkVideoSender.swift */,
-					200000000000000000000010 /* Info.plist */,
-					200000000000000000000022 /* Assets.xcassets */,
-					200000000000000000000021 /* LaunchScreen.storyboard */,
+				200000000000000000000009 /* NetworkVideoSender.swift */,
+				200000000000000000000024 /* BLEJoystickController.swift */,
+				200000000000000000000010 /* Info.plist */,
+				200000000000000000000022 /* Assets.xcassets */,
+				200000000000000000000021 /* LaunchScreen.storyboard */,
 			);
 			path = iOSCamera;
 			sourceTree = "<group>";
@@ -143,6 +152,7 @@
 				200000000000000000000015 /* UDPReceiver.swift */,
 				200000000000000000000016 /* H264SampleBuilder.swift */,
 				200000000000000000000017 /* Info.plist */,
+				200000000000000000000025 /* AppIcon.icns */,
 				200000000000000000000018 /* macOSReceiver.entitlements */,
 			);
 			path = macOSReceiver;
@@ -255,16 +265,17 @@
 		120000000000000000000003 /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
-				files = (
-					300000000000000000000022 /* LaunchScreen.storyboard in Resources */,
-					300000000000000000000023 /* Assets.xcassets in Resources */,
-				);
+			files = (
+				300000000000000000000022 /* LaunchScreen.storyboard in Resources */,
+				300000000000000000000023 /* Assets.xcassets in Resources */,
+			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 		120000000000000000000006 /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				300000000000000000000027 /* AppIcon.icns in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -284,6 +295,7 @@
 			files = (
 				300000000000000000000001 /* Packet.swift in Sources */,
 				300000000000000000000002 /* FrameReassembler.swift in Sources */,
+				300000000000000000000024 /* BLEZoomProtocol.swift in Sources */,
 				300000000000000000000003 /* iOSCameraApp.swift in Sources */,
 				300000000000000000000004 /* ContentView.swift in Sources */,
 				300000000000000000000005 /* CameraPreview.swift in Sources */,
@@ -291,6 +303,7 @@
 				300000000000000000000007 /* H264Encoder.swift in Sources */,
 				300000000000000000000008 /* BonjourBrowser.swift in Sources */,
 				300000000000000000000009 /* NetworkVideoSender.swift in Sources */,
+				300000000000000000000025 /* BLEJoystickController.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -316,6 +329,7 @@
 			files = (
 				300000000000000000000018 /* Packet.swift in Sources */,
 				300000000000000000000019 /* FrameReassembler.swift in Sources */,
+				300000000000000000000026 /* BLEZoomProtocol.swift in Sources */,
 				300000000000000000000020 /* SharedProtocolTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -388,9 +402,9 @@
 		};
 		400000000000000000000004 /* Debug */ = {
 			isa = XCBuildConfiguration;
-				buildSettings = {
-					ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
-					CODE_SIGN_STYLE = Automatic;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_LANGUAGE = en;
 				DEVELOPMENT_TEAM = TW9F922D62;
@@ -414,9 +428,9 @@
 		};
 		400000000000000000000005 /* Release */ = {
 			isa = XCBuildConfiguration;
-				buildSettings = {
-					ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
-					CODE_SIGN_STYLE = Automatic;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_LANGUAGE = en;
 				DEVELOPMENT_TEAM = TW9F922D62;
@@ -448,6 +462,7 @@
 				CURRENT_PROJECT_VERSION = 1;
 				DEAD_CODE_STRIPPING = YES;
 				DEVELOPMENT_LANGUAGE = en;
+				DEVELOPMENT_TEAM = TW9F922D62;
 				ENABLE_HARDENED_RUNTIME = YES;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = macOSReceiver/Info.plist;
@@ -474,6 +489,7 @@
 				CURRENT_PROJECT_VERSION = 1;
 				DEAD_CODE_STRIPPING = YES;
 				DEVELOPMENT_LANGUAGE = en;
+				DEVELOPMENT_TEAM = TW9F922D62;
 				ENABLE_HARDENED_RUNTIME = YES;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = macOSReceiver/Info.plist;

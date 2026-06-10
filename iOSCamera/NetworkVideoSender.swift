@@ -5,6 +5,7 @@ import UIKit
 final class NetworkVideoSender: @unchecked Sendable {
     var onStatusChanged: ((String) -> Void)?
     var onStatsChanged: ((String) -> Void)?
+    var onControlCommand: ((CameraControlPayload) -> Void)?
 
     private let queue = DispatchQueue(label: "iphonecam.network.sender")
     private var connection: NWConnection?
@@ -14,7 +15,9 @@ final class NetworkVideoSender: @unchecked Sendable {
     private var sentBytes = 0
     private var lastStatsDate = Date()
     private var connectionAttemptId = UUID()
+    private var receivingControlMessages = false
     private let encoder = JSONEncoder()
+    private let decoder = JSONDecoder()
 
     func connect(to endpoint: NWEndpoint, force: Bool = false) {
         queue.async { [weak self] in
@@ -26,6 +29,7 @@ final class NetworkVideoSender: @unchecked Sendable {
             let attemptId = UUID()
             self.connectionAttemptId = attemptId
             self.connection?.cancel()
+            self.receivingControlMessages = false
             let connection = NWConnection(to: endpoint, using: .udp)
             self.connection = connection
             connection.stateUpdateHandler = { [weak self] state in
@@ -68,6 +72,7 @@ final class NetworkVideoSender: @unchecked Sendable {
             self?.connection?.cancel()
             self?.connection = nil
             self?.ready = false
+            self?.receivingControlMessages = false
             self?.sentFrames = 0
             self?.sentBytes = 0
             self?.lastStatsDate = Date()
@@ -79,21 +84,50 @@ final class NetworkVideoSender: @unchecked Sendable {
         case .ready:
             ready = true
             onStatusChanged?("Connected to Mac")
+            if let connection, !receivingControlMessages {
+                receivingControlMessages = true
+                receiveControlMessages(on: connection)
+            }
             sendHelloIfReady()
             if let latestFormat {
                 sendFormatIfReady(latestFormat)
             }
         case .failed(let error):
             ready = false
+            receivingControlMessages = false
             onStatusChanged?("Connection failed: \(error.localizedDescription)")
         case .waiting(let error):
             ready = false
             onStatusChanged?("Connection waiting: \(error.localizedDescription)")
         case .cancelled:
             ready = false
+            receivingControlMessages = false
             onStatusChanged?("Disconnected")
         default:
             break
+        }
+    }
+
+    private func receiveControlMessages(on connection: NWConnection) {
+        connection.receiveMessage { [weak self, weak connection] data, _, _, error in
+            guard let self, let connection, self.connection === connection else {
+                return
+            }
+
+            if
+                let data,
+                let packet = CameraPacket(data: data),
+                packet.kind == .control,
+                let command = try? self.decoder.decode(CameraControlPayload.self, from: packet.payload)
+            {
+                self.onControlCommand?(command)
+            }
+
+            if error == nil {
+                self.receiveControlMessages(on: connection)
+            } else {
+                self.receivingControlMessages = false
+            }
         }
     }
 

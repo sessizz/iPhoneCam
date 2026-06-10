@@ -2,6 +2,71 @@ import AVFoundation
 import Foundation
 import UIKit
 
+enum LensSwitchingMode: String, CaseIterable, Identifiable {
+    case auto
+    case restricted
+    case locked
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .auto:
+            return "Auto"
+        case .restricted:
+            return "Restrict"
+        case .locked:
+            return "Lock"
+        }
+    }
+
+    var captureBehavior: AVCaptureDevice.PrimaryConstituentDeviceSwitchingBehavior {
+        switch self {
+        case .auto:
+            return .auto
+        case .restricted:
+            return .restricted
+        case .locked:
+            return .locked
+        }
+    }
+}
+
+enum VideoStabilizationSetting: String, CaseIterable, Identifiable {
+    case off
+    case standard
+    case cinematic
+    case auto
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .off:
+            return "Off"
+        case .standard:
+            return "Standard"
+        case .cinematic:
+            return "Cinematic"
+        case .auto:
+            return "Auto"
+        }
+    }
+
+    var captureMode: AVCaptureVideoStabilizationMode {
+        switch self {
+        case .off:
+            return .off
+        case .standard:
+            return .standard
+        case .cinematic:
+            return .cinematic
+        case .auto:
+            return .auto
+        }
+    }
+}
+
 final class CameraCaptureController: NSObject, ObservableObject, @unchecked Sendable {
     @Published var statusText = "Camera warming up..."
     @Published var warningText: String?
@@ -14,6 +79,8 @@ final class CameraCaptureController: NSObject, ObservableObject, @unchecked Send
     @Published private(set) var cameraModeText = "Back camera"
     @Published private(set) var activeLensText = "Lens: -"
     @Published private(set) var lensSwitchingText = "Lens switching: -"
+    @Published private(set) var lensSwitchingMode: LensSwitchingMode = .locked
+    @Published private(set) var stabilizationMode: VideoStabilizationSetting = .standard
     @Published private(set) var stabilizationModeText = "Stabilization: standard requested"
 
     let session = AVCaptureSession()
@@ -30,6 +97,9 @@ final class CameraCaptureController: NSObject, ObservableObject, @unchecked Send
     private var configured = false
     private var currentRotationAngle: CGFloat = 0
     private var displayZoomFactorMultiplier: CGFloat = 1
+    private var requestedLensSwitchingMode: LensSwitchingMode = .locked
+    private var requestedStabilizationMode: VideoStabilizationSetting = .standard
+    private var selectedFormatWarning: String?
     private var lastContinuousZoomIntensity: Double = 0
     private var lastContinuousZoomCommand = Date.distantPast
     private var lastStabilizationModePublish = Date.distantPast
@@ -142,6 +212,37 @@ final class CameraCaptureController: NSObject, ObservableObject, @unchecked Send
         }
     }
 
+    func setLensSwitchingMode(_ mode: LensSwitchingMode) {
+        sessionQueue.async { [weak self] in
+            guard let self else {
+                return
+            }
+            self.requestedLensSwitchingMode = mode
+            guard let device = self.captureDevice else {
+                self.publishLensSwitchingMode(mode)
+                return
+            }
+            self.applyLensSwitchingMode(on: device)
+            self.updateZoomCapabilities(for: device)
+        }
+    }
+
+    func setStabilizationMode(_ mode: VideoStabilizationSetting) {
+        sessionQueue.async { [weak self] in
+            guard let self else {
+                return
+            }
+            self.requestedStabilizationMode = mode
+            DispatchQueue.main.async { [weak self] in
+                self?.stabilizationMode = mode
+            }
+            guard let connection = self.videoOutput?.connection(with: .video) else {
+                return
+            }
+            self.applyVideoStabilization(on: connection)
+        }
+    }
+
     private func configureAndStart() {
         sessionQueue.async { [weak self] in
             guard let self else { return }
@@ -168,6 +269,8 @@ final class CameraCaptureController: NSObject, ObservableObject, @unchecked Send
                 }
                 if let captureDevice {
                     self.setInitialZoom(on: captureDevice)
+                    self.applyLensSwitchingMode(on: captureDevice)
+                    self.updateZoomCapabilities(for: captureDevice)
                 }
                 self.session.startRunning()
                 self.startZoomPolling()
@@ -192,6 +295,7 @@ final class CameraCaptureController: NSObject, ObservableObject, @unchecked Send
         let device = selection.device
         let selected = selection.format
         captureDevice = device
+        selectedFormatWarning = selected.warning
         displayZoomFactorMultiplier = Self.displayZoomFactorMultiplier(for: device)
 
         let input = try AVCaptureDeviceInput(device: device)
@@ -214,7 +318,8 @@ final class CameraCaptureController: NSObject, ObservableObject, @unchecked Send
 
         applyCurrentRotation()
         setInitialZoom(on: device)
-        updateZoomCapabilities(for: device, selectedFormat: selected)
+        applyLensSwitchingMode(on: device)
+        updateZoomCapabilities(for: device)
 
         return selected
     }
@@ -238,7 +343,7 @@ final class CameraCaptureController: NSObject, ObservableObject, @unchecked Send
             publishStabilizationMode("Stabilization: unsupported")
             return
         }
-        connection.preferredVideoStabilizationMode = .standard
+        connection.preferredVideoStabilizationMode = requestedStabilizationMode.captureMode
         publishStabilizationMode(for: connection)
     }
 
@@ -401,18 +506,50 @@ final class CameraCaptureController: NSObject, ObservableObject, @unchecked Send
         return SelectedCameraFormat(width: CameraProtocol.targetWidth, height: CameraProtocol.targetHeight, fps: fps, warning: warning)
     }
 
-    private func updateZoomCapabilities(for device: AVCaptureDevice, selectedFormat: SelectedCameraFormat) {
-        let minimum = displayedZoomFactor(forDeviceZoomFactor: device.minAvailableVideoZoomFactor)
+    private func applyLensSwitchingMode(on device: AVCaptureDevice) {
+        guard device.isVirtualDevice else {
+            publishLensSwitchingMode(requestedLensSwitchingMode)
+            return
+        }
+        guard device.activePrimaryConstituentDeviceSwitchingBehavior != .unsupported else {
+            publishLensSwitchingMode(.auto)
+            return
+        }
+
+        do {
+            try device.lockForConfiguration()
+            defer { device.unlockForConfiguration() }
+            device.setPrimaryConstituentDeviceSwitchingBehavior(
+                requestedLensSwitchingMode.captureBehavior,
+                restrictedSwitchingBehaviorConditions: []
+            )
+            publishLensSwitchingMode(requestedLensSwitchingMode)
+        } catch {
+            publishWarning(error.localizedDescription)
+        }
+    }
+
+    private func publishLensSwitchingMode(_ mode: LensSwitchingMode) {
+        DispatchQueue.main.async { [weak self] in
+            self?.lensSwitchingMode = mode
+        }
+    }
+
+    private func updateZoomCapabilities(for device: AVCaptureDevice) {
+        let rawMinimum = displayedZoomFactor(forDeviceZoomFactor: device.minAvailableVideoZoomFactor)
         let maximum = displayedZoomFactor(forDeviceZoomFactor: maximumDeviceZoomFactor(for: device))
         let switchOvers = device.virtualDeviceSwitchOverVideoZoomFactors
             .map { displayedZoomFactor(forDeviceZoomFactor: CGFloat(truncating: $0)) }
-            .filter { $0 >= minimum && $0 <= maximum }
+            .filter { $0 > 0 && $0 <= maximum }
+        let inferredUltraWideMinimum = switchOvers.first.map { $0 / 2 } ?? rawMinimum
+        let minimum = min(rawMinimum, inferredUltraWideMinimum)
         let cameraText = device.isVirtualDevice ? "Virtual camera: \(device.localizedName)" : "Single camera: \(device.localizedName)"
         let activeLensText = activeLensText(for: device)
         let lensSwitchingText = lensSwitchingText(for: device, switchOvers: switchOvers)
         let virtualWarning = device.isVirtualDevice ? nil : "Virtual camera unavailable; lens switching disabled."
-        let warnings = [selectedFormat.warning, virtualWarning].compactMap { $0 }
+        let warnings = [selectedFormatWarning, virtualWarning].compactMap { $0 }
         let currentZoom = displayedZoomFactor(forDeviceZoomFactor: device.videoZoomFactor)
+        let currentMode = requestedLensSwitchingMode
 
         DispatchQueue.main.async { [weak self] in
             self?.minZoomFactor = minimum
@@ -422,6 +559,7 @@ final class CameraCaptureController: NSObject, ObservableObject, @unchecked Send
             self?.cameraModeText = cameraText
             self?.activeLensText = activeLensText
             self?.lensSwitchingText = lensSwitchingText
+            self?.lensSwitchingMode = currentMode
             self?.warningText = warnings.isEmpty ? nil : warnings.joined(separator: " ")
         }
     }
@@ -469,10 +607,11 @@ final class CameraCaptureController: NSObject, ObservableObject, @unchecked Send
             return "Lens switching: unavailable"
         }
         let behavior = Self.switchingBehaviorName(device.activePrimaryConstituentDeviceSwitchingBehavior)
+        let configured = Self.switchingBehaviorName(device.primaryConstituentDeviceSwitchingBehavior)
         let thresholds = switchOvers.isEmpty
             ? "no thresholds"
             : switchOvers.map { String(format: "%.1fx", $0) }.joined(separator: ", ")
-        return "Lens switching: \(behavior), \(thresholds)"
+        return "Lens switching: \(behavior) active, \(configured) set, \(thresholds)"
     }
 
     private static func lensName(for device: AVCaptureDevice) -> String {

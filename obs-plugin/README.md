@@ -23,4 +23,7 @@ The plugin bundle is produced as `build/obs-plugin/iphonecam-obs.plugin`.
 
 - Add source type `iPhoneCam` in OBS.
 - Keep the standalone Mac receiver app closed while testing, because both advertise `_iphonecam._udp`.
+- Bind the `iPhoneCam: Zoom In Slow/Medium/Fast`, `iPhoneCam: Zoom Out Slow/Medium/Fast`, and
+  `iPhoneCam: Reset Zoom` actions in OBS Settings > Hotkeys. Press-and-hold zoom keys ramp the iPhone lens;
+  releasing the key stops the ramp.
 - FPS and bitrate are reported from the iPhone stream; OBS does not control the encoder yet.

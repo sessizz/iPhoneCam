@@ -11,6 +11,7 @@ enum class PacketKind : uint8_t {
     Hello = 1,
     Format = 2,
     FrameFragment = 3,
+    Control = 4,
 };
 
 constexpr uint32_t kPacketMagic = 0x4950434d;
@@ -56,8 +57,27 @@ struct EncodedVideoFrame {
     std::vector<uint8_t> data;
 };
 
+enum class ControlAction {
+    ZoomIn,
+    ZoomOut,
+    StopZoom,
+    ResetZoom,
+};
+
+enum class ControlSpeed {
+    Slow,
+    Medium,
+    Fast,
+};
+
+struct ControlCommand {
+    ControlAction action = ControlAction::StopZoom;
+    ControlSpeed speed = ControlSpeed::Medium;
+};
+
 std::optional<CameraPacket> parsePacket(const uint8_t *data, size_t size);
 std::vector<uint8_t> encodePacket(const CameraPacket &packet);
+std::vector<uint8_t> encodeControlPayload(const ControlCommand &command);
 
 std::optional<HelloPayload> parseHelloPayload(const std::vector<uint8_t> &payload);
 std::optional<FormatPayload> parseFormatPayload(const std::vector<uint8_t> &payload);

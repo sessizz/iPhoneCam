@@ -7,6 +7,8 @@
 
 namespace iphonecam {
 
+struct ControlCommand;
+
 class NetworkReceiver {
 public:
     using PacketCallback = std::function<void(const std::vector<uint8_t> &data)>;
@@ -19,6 +21,7 @@ public:
     void setStatusCallback(StatusCallback callback);
     void start(const std::string &receiverName);
     void stop();
+    void sendControlCommand(const ControlCommand &command);
 
 private:
     struct Impl;

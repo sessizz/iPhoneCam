@@ -133,6 +133,34 @@ std::string payloadString(const std::vector<uint8_t> &payload)
     return std::string(reinterpret_cast<const char *>(payload.data()), payload.size());
 }
 
+const char *controlActionName(ControlAction action)
+{
+    switch (action) {
+    case ControlAction::ZoomIn:
+        return "zoomIn";
+    case ControlAction::ZoomOut:
+        return "zoomOut";
+    case ControlAction::StopZoom:
+        return "stopZoom";
+    case ControlAction::ResetZoom:
+        return "resetZoom";
+    }
+    return "stopZoom";
+}
+
+const char *controlSpeedName(ControlSpeed speed)
+{
+    switch (speed) {
+    case ControlSpeed::Slow:
+        return "slow";
+    case ControlSpeed::Medium:
+        return "medium";
+    case ControlSpeed::Fast:
+        return "fast";
+    }
+    return "medium";
+}
+
 } // namespace
 
 std::optional<CameraPacket> parsePacket(const uint8_t *data, size_t size)
@@ -143,7 +171,7 @@ std::optional<CameraPacket> parsePacket(const uint8_t *data, size_t size)
         return std::nullopt;
 
     const auto rawKind = data[5];
-    if (rawKind < uint8_t(PacketKind::Hello) || rawKind > uint8_t(PacketKind::FrameFragment))
+    if (rawKind < uint8_t(PacketKind::Hello) || rawKind > uint8_t(PacketKind::Control))
         return std::nullopt;
 
     const uint32_t payloadLength = readU32BE(data + 32);
@@ -178,6 +206,18 @@ std::vector<uint8_t> encodePacket(const CameraPacket &packet)
     appendU32BE(out, uint32_t(packet.payload.size()));
     out.insert(out.end(), packet.payload.begin(), packet.payload.end());
     return out;
+}
+
+std::vector<uint8_t> encodeControlPayload(const ControlCommand &command)
+{
+    std::string json = std::string("{\"action\":\"") + controlActionName(command.action) + "\"";
+    if (command.action == ControlAction::ZoomIn || command.action == ControlAction::ZoomOut) {
+        json += ",\"speed\":\"";
+        json += controlSpeedName(command.speed);
+        json += "\"";
+    }
+    json += "}";
+    return std::vector<uint8_t>(json.begin(), json.end());
 }
 
 std::optional<HelloPayload> parseHelloPayload(const std::vector<uint8_t> &payload)

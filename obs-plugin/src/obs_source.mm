@@ -25,6 +25,8 @@ const char *packetKindName(PacketKind kind)
         return "format";
     case PacketKind::FrameFragment:
         return "frame";
+    case PacketKind::Control:
+        return "control";
     }
     return "unknown";
 }
@@ -63,6 +65,41 @@ SourceSettings readSettings(obs_data_t *settings)
     return result;
 }
 
+void zoomInSlowHotkey(void *data, obs_hotkey_id, obs_hotkey_t *, bool pressed)
+{
+    static_cast<IPhoneCamSource *>(data)->handleZoomHotkey(ControlAction::ZoomIn, ControlSpeed::Slow, pressed);
+}
+
+void zoomInMediumHotkey(void *data, obs_hotkey_id, obs_hotkey_t *, bool pressed)
+{
+    static_cast<IPhoneCamSource *>(data)->handleZoomHotkey(ControlAction::ZoomIn, ControlSpeed::Medium, pressed);
+}
+
+void zoomInFastHotkey(void *data, obs_hotkey_id, obs_hotkey_t *, bool pressed)
+{
+    static_cast<IPhoneCamSource *>(data)->handleZoomHotkey(ControlAction::ZoomIn, ControlSpeed::Fast, pressed);
+}
+
+void zoomOutSlowHotkey(void *data, obs_hotkey_id, obs_hotkey_t *, bool pressed)
+{
+    static_cast<IPhoneCamSource *>(data)->handleZoomHotkey(ControlAction::ZoomOut, ControlSpeed::Slow, pressed);
+}
+
+void zoomOutMediumHotkey(void *data, obs_hotkey_id, obs_hotkey_t *, bool pressed)
+{
+    static_cast<IPhoneCamSource *>(data)->handleZoomHotkey(ControlAction::ZoomOut, ControlSpeed::Medium, pressed);
+}
+
+void zoomOutFastHotkey(void *data, obs_hotkey_id, obs_hotkey_t *, bool pressed)
+{
+    static_cast<IPhoneCamSource *>(data)->handleZoomHotkey(ControlAction::ZoomOut, ControlSpeed::Fast, pressed);
+}
+
+void resetZoomHotkey(void *data, obs_hotkey_id, obs_hotkey_t *, bool pressed)
+{
+    static_cast<IPhoneCamSource *>(data)->handleResetZoomHotkey(pressed);
+}
+
 } // namespace
 
 IPhoneCamSource::IPhoneCamSource(obs_data_t *settings, obs_source_t *source)
@@ -84,11 +121,13 @@ IPhoneCamSource::IPhoneCamSource(obs_data_t *settings, obs_source_t *source)
         markStatsDirty();
     });
     receiver_->setPacketCallback([this](const std::vector<uint8_t> &data) { handleDatagram(data); });
+    registerHotkeys();
     startReceiver();
 }
 
 IPhoneCamSource::~IPhoneCamSource()
 {
+    unregisterHotkeys();
     stopReceiver();
     dispatch_sync(decodeQueue_, ^{
       decoder_->reset();
@@ -162,6 +201,65 @@ void IPhoneCamSource::stopReceiver()
         receiver_->stop();
 }
 
+void IPhoneCamSource::registerHotkeys()
+{
+    struct HotkeyDefinition {
+        const char *name;
+        const char *description;
+        obs_hotkey_func callback;
+    };
+
+    const HotkeyDefinition definitions[] = {
+        {"iphonecam.zoom_in_slow", "iPhoneCam: Zoom In Slow", zoomInSlowHotkey},
+        {"iphonecam.zoom_in_medium", "iPhoneCam: Zoom In Medium", zoomInMediumHotkey},
+        {"iphonecam.zoom_in_fast", "iPhoneCam: Zoom In Fast", zoomInFastHotkey},
+        {"iphonecam.zoom_out_slow", "iPhoneCam: Zoom Out Slow", zoomOutSlowHotkey},
+        {"iphonecam.zoom_out_medium", "iPhoneCam: Zoom Out Medium", zoomOutMediumHotkey},
+        {"iphonecam.zoom_out_fast", "iPhoneCam: Zoom Out Fast", zoomOutFastHotkey},
+        {"iphonecam.reset_zoom", "iPhoneCam: Reset Zoom", resetZoomHotkey},
+    };
+
+    for (const auto &definition : definitions) {
+        const auto id = obs_hotkey_register_source(source_, definition.name, definition.description,
+                                                   definition.callback, this);
+        if (id != OBS_INVALID_HOTKEY_ID)
+            hotkeyIds_.push_back(id);
+    }
+}
+
+void IPhoneCamSource::unregisterHotkeys()
+{
+    for (const auto id : hotkeyIds_) {
+        if (id != OBS_INVALID_HOTKEY_ID)
+            obs_hotkey_unregister(id);
+    }
+    hotkeyIds_.clear();
+}
+
+void IPhoneCamSource::handleZoomHotkey(ControlAction action, ControlSpeed speed, bool pressed)
+{
+    ControlCommand command;
+    command.action = pressed ? action : ControlAction::StopZoom;
+    command.speed = speed;
+    sendControlCommand(command);
+}
+
+void IPhoneCamSource::handleResetZoomHotkey(bool pressed)
+{
+    if (!pressed)
+        return;
+
+    ControlCommand command;
+    command.action = ControlAction::ResetZoom;
+    sendControlCommand(command);
+}
+
+void IPhoneCamSource::sendControlCommand(const ControlCommand &command)
+{
+    if (receiver_)
+        receiver_->sendControlCommand(command);
+}
+
 void IPhoneCamSource::handleDatagram(const std::vector<uint8_t> &data)
 {
     auto packet = parsePacket(data.data(), data.size());
@@ -220,6 +318,8 @@ void IPhoneCamSource::handleDatagram(const std::vector<uint8_t> &data)
         }
         break;
     }
+    case PacketKind::Control:
+        break;
     }
 }
 
