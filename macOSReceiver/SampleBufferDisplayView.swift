@@ -38,35 +38,38 @@ final class SampleBufferNSView: NSView {
 
 final class VideoRenderer: @unchecked Sendable {
     private let lock = NSLock()
-    private weak var displayLayer: AVSampleBufferDisplayLayer?
+    // The layer is main-actor isolated; its renderer is not, so the render queue feeds the renderer directly.
+    private weak var videoRenderer: AVSampleBufferVideoRenderer?
 
+    @MainActor
     func attach(to displayLayer: AVSampleBufferDisplayLayer) {
+        displayLayer.videoGravity = .resizeAspect
+        let videoRenderer = displayLayer.sampleBufferRenderer
         lock.lock()
         defer { lock.unlock() }
-        self.displayLayer = displayLayer
-        displayLayer.videoGravity = .resizeAspect
+        self.videoRenderer = videoRenderer
     }
 
     func enqueue(_ sampleBuffer: CMSampleBuffer) -> Bool {
         lock.lock()
-        let layer = self.displayLayer
+        let renderer = self.videoRenderer
         lock.unlock()
 
-        guard let layer else {
+        guard let renderer else {
             return false
         }
-        if layer.status == .failed {
-            layer.flush()
+        if renderer.status == .failed {
+            renderer.flush()
             return false
         }
-        layer.enqueue(sampleBuffer)
+        renderer.enqueue(sampleBuffer)
         return true
     }
 
     func reset() {
         lock.lock()
-        let layer = self.displayLayer
+        let renderer = self.videoRenderer
         lock.unlock()
-        layer?.flushAndRemoveImage()
+        renderer?.flush(removingDisplayedImage: true, completionHandler: nil)
     }
 }

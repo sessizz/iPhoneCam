@@ -5,10 +5,15 @@ import UIKit
 final class CameraPreviewRenderer: ObservableObject {
     private let lock = NSLock()
     private weak var displayLayer: AVSampleBufferDisplayLayer?
+    // The layer is main-actor isolated; its renderer is not, so the capture queue feeds the renderer directly.
+    private weak var videoRenderer: AVSampleBufferVideoRenderer?
 
+    @MainActor
     func attach(to displayLayer: AVSampleBufferDisplayLayer) {
+        let videoRenderer = displayLayer.sampleBufferRenderer
         lock.lock()
         self.displayLayer = displayLayer
+        self.videoRenderer = videoRenderer
         lock.unlock()
     }
 
@@ -16,26 +21,27 @@ final class CameraPreviewRenderer: ObservableObject {
         lock.lock()
         if self.displayLayer === displayLayer {
             self.displayLayer = nil
+            self.videoRenderer = nil
         }
         lock.unlock()
     }
 
     func display(_ sampleBuffer: CMSampleBuffer) {
         lock.lock()
-        let displayLayer = displayLayer
+        let renderer = videoRenderer
         lock.unlock()
 
-        guard let displayLayer else {
+        guard let renderer else {
             return
         }
-        if displayLayer.status == .failed {
-            displayLayer.flush()
+        if renderer.status == .failed {
+            renderer.flush()
         }
-        guard displayLayer.isReadyForMoreMediaData else {
+        guard renderer.isReadyForMoreMediaData else {
             return
         }
         markForImmediateDisplay(sampleBuffer)
-        displayLayer.enqueue(sampleBuffer)
+        renderer.enqueue(sampleBuffer)
     }
 
     private func markForImmediateDisplay(_ sampleBuffer: CMSampleBuffer) {
