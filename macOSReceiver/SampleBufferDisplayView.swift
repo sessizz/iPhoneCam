@@ -36,30 +36,37 @@ final class SampleBufferNSView: NSView {
     }
 }
 
-@MainActor
-final class VideoRenderer {
+final class VideoRenderer: @unchecked Sendable {
+    private let lock = NSLock()
     private weak var displayLayer: AVSampleBufferDisplayLayer?
 
     func attach(to displayLayer: AVSampleBufferDisplayLayer) {
+        lock.lock()
+        defer { lock.unlock() }
         self.displayLayer = displayLayer
         displayLayer.videoGravity = .resizeAspect
     }
 
     func enqueue(_ sampleBuffer: CMSampleBuffer) -> Bool {
-        guard let displayLayer else {
+        lock.lock()
+        let layer = self.displayLayer
+        lock.unlock()
+
+        guard let layer else {
             return false
         }
-        if displayLayer.status == .failed {
-            displayLayer.flush()
-        }
-        guard displayLayer.isReadyForMoreMediaData else {
+        if layer.status == .failed {
+            layer.flush()
             return false
         }
-        displayLayer.enqueue(sampleBuffer)
+        layer.enqueue(sampleBuffer)
         return true
     }
 
     func reset() {
-        displayLayer?.flushAndRemoveImage()
+        lock.lock()
+        let layer = self.displayLayer
+        lock.unlock()
+        layer?.flushAndRemoveImage()
     }
 }

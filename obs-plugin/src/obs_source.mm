@@ -13,7 +13,10 @@ namespace iphonecam {
 namespace {
 
 constexpr const char *kSettingReceiverName = "receiver_name";
+constexpr const char *kSettingTargetDevice = "target_device";
 constexpr const char *kSettingLatency = "latency_ms";
+constexpr const char *kSettingAudioEnabled = "audio_enabled";
+constexpr const char *kSettingAudioOffset = "audio_offset_ms";
 constexpr uint64_t kOneSecondNanos = 1000000000ULL;
 constexpr auto kKeyFrameRequestInterval = std::chrono::milliseconds(250);
 
@@ -28,6 +31,8 @@ const char *packetKindName(PacketKind kind)
         return "frame";
     case PacketKind::Control:
         return "control";
+    case PacketKind::Audio:
+        return "audio";
     }
     return "unknown";
 }
@@ -37,6 +42,7 @@ std::string formatStats(const SourceStats &stats)
     char buffer[768];
     std::snprintf(buffer, sizeof(buffer),
                   "Status: %s\n"
+                  "Target: %s\n"
                   "Device: %s\n"
                   "Format: %s\n"
                   "UDP Port: %s\n"
@@ -49,7 +55,8 @@ std::string formatStats(const SourceStats &stats)
                   "Keyframe Requests: %d\n"
                   "Waiting For Keyframe: %s\n"
                   "No Signal: black after 1s",
-                  stats.status.c_str(), stats.deviceName.c_str(), stats.format.c_str(), stats.udpPort.c_str(),
+                  stats.status.c_str(), stats.targetDevice.c_str(), stats.deviceName.c_str(),
+                  stats.format.c_str(), stats.udpPort.c_str(),
                   stats.receivedFps, stats.displayedFps, stats.receivedFrames, stats.displayedFrames,
                   stats.networkDroppedFrames, stats.decodeDroppedFrames, stats.keyFrameRequests,
                   stats.waitingForKeyFrame ? "yes" : "no");
@@ -62,9 +69,14 @@ SourceSettings readSettings(obs_data_t *settings)
     const char *receiverName = obs_data_get_string(settings, kSettingReceiverName);
     if (receiverName && *receiverName)
         result.receiverName = receiverName;
+    const char *targetDevice = obs_data_get_string(settings, kSettingTargetDevice);
+    if (targetDevice && *targetDevice)
+        result.targetDevice = targetDevice;
     const long long latency = obs_data_get_int(settings, kSettingLatency);
     if (latency == 0 || latency == 60 || latency == 120)
         result.latencyMs = int(latency);
+    result.audioEnabled = obs_data_get_bool(settings, kSettingAudioEnabled);
+    result.audioOffsetMs = int(obs_data_get_int(settings, kSettingAudioOffset));
     return result;
 }
 
@@ -110,6 +122,7 @@ IPhoneCamSource::IPhoneCamSource(obs_data_t *settings, obs_source_t *source)
       settings_(readSettings(settings)),
       receiver_(std::make_unique<NetworkReceiver>()),
       decoder_(std::make_unique<VideoDecoder>()),
+      audioDecoder_(std::make_unique<AudioDecoder>()),
       reassembler_(std::chrono::milliseconds(120)),
       lastFrameAt_(std::chrono::steady_clock::now()),
       lastStatsAt_(std::chrono::steady_clock::now())
@@ -143,7 +156,7 @@ IPhoneCamSource::~IPhoneCamSource()
 void IPhoneCamSource::update(obs_data_t *settings)
 {
     const auto next = readSettings(settings);
-    const bool restartNeeded = next.receiverName != settings_.receiverName;
+    const bool restartNeeded = next.receiverName != settings_.receiverName || next.targetDevice != settings_.targetDevice;
     const bool latencyChanged = next.latencyMs != settings_.latencyMs;
     settings_ = next;
     if (latencyChanged)
@@ -158,6 +171,7 @@ void IPhoneCamSource::restart()
     {
         std::lock_guard<std::mutex> lock(mutex_);
         stats_ = SourceStats{};
+        stats_.targetDevice = settings_.targetDevice.empty() ? "Auto" : settings_.targetDevice;
         stats_.status = "Restarting receiver";
         reassembler_.reset();
         lastFormat_.reset();
@@ -196,6 +210,11 @@ SourceStats IPhoneCamSource::stats() const
 
 void IPhoneCamSource::startReceiver()
 {
+    receiver_->setTargetDevice(settings_.targetDevice);
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        stats_.targetDevice = settings_.targetDevice.empty() ? "Auto" : settings_.targetDevice;
+    }
     receiver_->start(settings_.receiverName);
 }
 
@@ -345,11 +364,20 @@ void IPhoneCamSource::handleDatagram(const std::vector<uint8_t> &data)
     }
     case PacketKind::Control:
         break;
+    case PacketKind::Audio:
+        handleAudio(*packet);
+        break;
     }
 }
 
 void IPhoneCamSource::handleHello(const HelloPayload &hello)
 {
+    registerDiscoveredDevice(hello.deviceName);
+    if (!settings_.targetDevice.empty() && hello.deviceName != settings_.targetDevice) {
+        blog(LOG_INFO, "[iPhoneCam] Ignoring stream from '%s' because target is '%s'", hello.deviceName.c_str(),
+             settings_.targetDevice.c_str());
+        return;
+    }
     blog(LOG_INFO, "[iPhoneCam] Hello from '%s': %dx%d @ %d FPS, %d bps", hello.deviceName.c_str(), hello.width,
          hello.height, hello.fps, hello.bitrate);
     {
@@ -407,6 +435,7 @@ void IPhoneCamSource::handleFrame(const EncodedVideoFrame &frame)
             requestKeyFrame();
             return;
         }
+        droppingUntilKeyFrame_ = false;
     }
 
     // frameId is the iPhone's per-connection send sequence, so a non-keyframe only decodes cleanly when it
@@ -501,10 +530,20 @@ void IPhoneCamSource::resetDecoder()
 {
     decodeGeneration_.fetch_add(1);
     droppingUntilKeyFrame_ = false;
+    {
+        std::lock_guard<std::mutex> lock(timebaseMutex_);
+        videoBaseObsTime_ = 0;
+        videoBaseCameraPts_ = 0;
+        lastVideoPts_ = 0;
+        audioBaseObsTime_ = 0;
+        audioBaseCameraPts_ = 0;
+        lastAudioPts_ = 0;
+    }
     dispatch_sync(decodeQueue_, ^{});
     std::lock_guard<std::mutex> decoderLock(decoderMutex_);
     decoder_->reset();
     pendingDecodeFrames_ = 0;
+    lastQueuedFrameId_ = 0;
 }
 
 void IPhoneCamSource::beginLatencyCatchUp()
@@ -526,6 +565,7 @@ void IPhoneCamSource::beginLatencyCatchUp()
         stats_.decodeDroppedFrames += pending;
     }
     markStatsDirty();
+    requestKeyFrame();
 
     dispatch_async(decodeQueue_, ^{
       if (generation != decodeGeneration_.load())
@@ -536,18 +576,87 @@ void IPhoneCamSource::beginLatencyCatchUp()
           std::lock_guard<std::mutex> lock(mutex_);
           format = lastFormat_;
       }
-
-      std::lock_guard<std::mutex> decoderLock(decoderMutex_);
-      decoder_->reset();
+      std::string error;
       if (format) {
-          std::string error;
-          if (!decoder_->configure(*format, error)) {
-              blog(LOG_ERROR, "[iPhoneCam] Decoder reconfigure during latency catch-up failed: %s", error.c_str());
-              std::lock_guard<std::mutex> lock(mutex_);
-              stats_.status = "Format error: " + error;
-          }
+          std::lock_guard<std::mutex> decoderLock(decoderMutex_);
+          decoder_->configure(*format, error);
       }
     });
+    audioDecoder_->reset();
+}
+
+uint64_t IPhoneCamSource::getVideoObsTimestamp(uint64_t ptsNanos, int64_t offsetNs)
+{
+    std::lock_guard<std::mutex> lock(timebaseMutex_);
+    const uint64_t nowObs = os_gettime_ns();
+
+    const bool isFirst = (videoBaseObsTime_ == 0);
+    const bool isRewind = (lastVideoPts_ > 0 && ptsNanos < lastVideoPts_);
+    const bool isHugeGap = (lastVideoPts_ > 0 && (ptsNanos - lastVideoPts_) > 1000000000ULL);
+
+    if (isFirst || isRewind || isHugeGap) {
+        videoBaseObsTime_ = nowObs;
+        videoBaseCameraPts_ = ptsNanos;
+    }
+    lastVideoPts_ = ptsNanos;
+
+    const int64_t ptsOffset = int64_t(ptsNanos) - int64_t(videoBaseCameraPts_);
+    int64_t computed = int64_t(videoBaseObsTime_) + ptsOffset + offsetNs;
+
+    // Prevent frames from falling drastically behind or ahead of real-time (>500ms)
+    if (computed < int64_t(nowObs) - 500000000LL || computed > int64_t(nowObs) + 500000000LL) {
+        videoBaseObsTime_ = nowObs;
+        videoBaseCameraPts_ = ptsNanos;
+        computed = int64_t(nowObs) + offsetNs;
+    }
+
+    return uint64_t(std::max<int64_t>(0, computed));
+}
+
+uint64_t IPhoneCamSource::getAudioObsTimestamp(uint64_t ptsNanos, int64_t offsetNs)
+{
+    std::lock_guard<std::mutex> lock(timebaseMutex_);
+    const uint64_t nowObs = os_gettime_ns();
+
+    // If video has established a reference epoch, anchor audio to it for lip sync
+    if (videoBaseObsTime_ > 0 && videoBaseCameraPts_ > 0) {
+        const int64_t ptsOffset = int64_t(ptsNanos) - int64_t(videoBaseCameraPts_);
+        const int64_t computed = int64_t(videoBaseObsTime_) + ptsOffset + offsetNs;
+        lastAudioPts_ = ptsNanos;
+        return uint64_t(std::max<int64_t>(0, computed));
+    }
+
+    const bool isFirst = (audioBaseObsTime_ == 0);
+    const bool isRewind = (lastAudioPts_ > 0 && ptsNanos < lastAudioPts_);
+    const bool isHugeGap = (lastAudioPts_ > 0 && (ptsNanos - lastAudioPts_) > 1000000000ULL);
+
+    if (isFirst || isRewind || isHugeGap) {
+        audioBaseObsTime_ = nowObs;
+        audioBaseCameraPts_ = ptsNanos;
+    }
+    lastAudioPts_ = ptsNanos;
+
+    const int64_t ptsOffset = int64_t(ptsNanos) - int64_t(audioBaseCameraPts_);
+    const int64_t computed = int64_t(audioBaseObsTime_) + ptsOffset + offsetNs;
+    return uint64_t(std::max<int64_t>(0, computed));
+}
+
+void IPhoneCamSource::handleAudio(const CameraPacket &packet)
+{
+    if (!settings_.audioEnabled)
+        return;
+
+    DecodedAudioFrame audioFrame;
+    std::string error;
+    if (!audioDecoder_->decode(packet.payload.data(), packet.payload.size(), packet.ptsNanos, audioFrame, error)) {
+        if (audioErrorLogs_ < 10) {
+            blog(LOG_WARNING, "[iPhoneCam] Audio decode failed (%zu bytes): %s", packet.payload.size(), error.c_str());
+            audioErrorLogs_ += 1;
+        }
+        return;
+    }
+
+    outputDecodedAudio(audioFrame);
 }
 
 void IPhoneCamSource::outputDecodedFrame(const DecodedFrame &frame)
@@ -571,7 +680,10 @@ void IPhoneCamSource::outputDecodedFrame(const DecodedFrame &frame)
     obsFrame.linesize[1] = uint32_t(CVPixelBufferGetBytesPerRowOfPlane(frame.pixelBuffer, 1));
     obsFrame.width = uint32_t(CVPixelBufferGetWidth(frame.pixelBuffer));
     obsFrame.height = uint32_t(CVPixelBufferGetHeight(frame.pixelBuffer));
-    obsFrame.timestamp = os_gettime_ns() + uint64_t(settings_.latencyMs) * 1000000ULL;
+
+    const int64_t latencyNs = int64_t(settings_.latencyMs) * 1000000LL;
+    obsFrame.timestamp = getVideoObsTimestamp(frame.ptsNanos, latencyNs);
+
     obsFrame.format = VIDEO_FORMAT_NV12;
     obsFrame.full_range = frame.fullRange;
     obsFrame.trc = VIDEO_TRC_DEFAULT;
@@ -584,6 +696,25 @@ void IPhoneCamSource::outputDecodedFrame(const DecodedFrame &frame)
     obs_source_output_video(source_, &obsFrame);
 
     CVPixelBufferUnlockBaseAddress(frame.pixelBuffer, kCVPixelBufferLock_ReadOnly);
+}
+
+void IPhoneCamSource::outputDecodedAudio(const DecodedAudioFrame &frame)
+{
+    if (frame.frames == 0 || frame.pcmData.empty())
+        return;
+
+    const int64_t totalOffsetNs = (int64_t(settings_.latencyMs) + int64_t(settings_.audioOffsetMs)) * 1000000LL;
+    const uint64_t audioTimestamp = getAudioObsTimestamp(frame.ptsNanos, totalOffsetNs);
+
+    obs_source_audio obsAudio = {};
+    obsAudio.data[0] = reinterpret_cast<const uint8_t *>(frame.pcmData.data());
+    obsAudio.frames = frame.frames;
+    obsAudio.speakers = SPEAKERS_STEREO;
+    obsAudio.format = AUDIO_FORMAT_FLOAT;
+    obsAudio.samples_per_sec = frame.sampleRate;
+    obsAudio.timestamp = audioTimestamp;
+
+    obs_source_output_audio(source_, &obsAudio);
 }
 
 void IPhoneCamSource::outputBlackFrame()
@@ -677,13 +808,29 @@ static uint32_t iphonecam_get_height(void *data)
 static void iphonecam_defaults(obs_data_t *settings)
 {
     obs_data_set_default_string(settings, "receiver_name", "iPhoneCam OBS");
+    obs_data_set_default_string(settings, "target_device", "");
     obs_data_set_default_int(settings, "latency_ms", 0);
+    obs_data_set_default_bool(settings, "audio_enabled", true);
+    obs_data_set_default_int(settings, "audio_offset_ms", 0);
 }
 
 static bool iphonecam_restart_clicked(obs_properties_t *, obs_property_t *, void *data)
 {
     if (data)
         static_cast<IPhoneCamSource *>(data)->restart();
+    return true;
+}
+
+static bool iphonecam_refresh_devices_clicked(obs_properties_t *props, obs_property_t *, void *)
+{
+    obs_property_t *deviceList = obs_properties_get(props, "target_device");
+    if (!deviceList)
+        return false;
+    obs_property_list_clear(deviceList);
+    obs_property_list_add_string(deviceList, "Auto (First Available)", "");
+    for (const auto &dev : iphonecam::getDiscoveredDevices()) {
+        obs_property_list_add_string(deviceList, dev.c_str(), dev.c_str());
+    }
     return true;
 }
 
@@ -703,11 +850,23 @@ static obs_properties_t *iphonecam_properties(void *data)
     obs_properties_t *props = obs_properties_create();
     obs_properties_add_text(props, "receiver_name", "Receiver name", OBS_TEXT_DEFAULT);
 
+    obs_property_t *deviceList = obs_properties_add_list(
+        props, "target_device", "Target iPhone", OBS_COMBO_TYPE_EDITABLE, OBS_COMBO_FORMAT_STRING);
+    obs_property_list_add_string(deviceList, "Auto (First Available)", "");
+    for (const auto &dev : iphonecam::getDiscoveredDevices()) {
+        obs_property_list_add_string(deviceList, dev.c_str(), dev.c_str());
+    }
+
+    obs_properties_add_button(props, "refresh_devices", "Refresh Devices", iphonecam_refresh_devices_clicked);
+
     obs_property_t *latency = obs_properties_add_list(props, "latency_ms", "Latency", OBS_COMBO_TYPE_LIST,
                                                       OBS_COMBO_FORMAT_INT);
     obs_property_list_add_int(latency, "Low 0 ms", 0);
     obs_property_list_add_int(latency, "Balanced 60 ms", 60);
     obs_property_list_add_int(latency, "Smooth 120 ms", 120);
+
+    obs_properties_add_bool(props, "audio_enabled", "Enable Audio (Stereo)");
+    obs_properties_add_int_slider(props, "audio_offset_ms", "Audio Sync Offset (ms)", -500, 500, 10);
 
     obs_properties_add_button(props, "restart_receiver", "Restart Receiver", iphonecam_restart_clicked);
     obs_properties_add_button(props, "refresh_stats", "Refresh Stats", iphonecam_refresh_stats_clicked);
@@ -738,7 +897,7 @@ obs_source_info iphonecam_source_info = [] {
     obs_source_info info = {};
     info.id = "iphonecam_source";
     info.type = OBS_SOURCE_TYPE_INPUT;
-    info.output_flags = OBS_SOURCE_ASYNC_VIDEO;
+    info.output_flags = OBS_SOURCE_ASYNC_VIDEO | OBS_SOURCE_AUDIO;
     info.get_name = iphonecam_get_name;
     info.create = iphonecam_create;
     info.destroy = iphonecam_destroy;

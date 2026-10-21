@@ -9,6 +9,9 @@ namespace iphonecam {
 
 struct ControlCommand;
 
+std::vector<std::string> getDiscoveredDevices();
+void registerDiscoveredDevice(const std::string &name);
+
 class NetworkReceiver {
 public:
     using PacketCallback = std::function<void(const std::vector<uint8_t> &data)>;
@@ -19,12 +22,13 @@ public:
 
     void setPacketCallback(PacketCallback callback);
     void setStatusCallback(StatusCallback callback);
+    void setTargetDevice(const std::string &targetDevice);
     void start(const std::string &receiverName);
     void stop();
     void sendControlCommand(const ControlCommand &command);
 
-private:
     struct Impl;
+private:
     Impl *impl_ = nullptr;
 };
 

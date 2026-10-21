@@ -70,7 +70,7 @@ void testResetControlPayloadOmitsSpeed()
     assert(json == R"({"action":"resetZoom"})");
 }
 
-void testKeyFrameRequestPayload()
+void testRequestKeyFrameControlPayloadOmitsSpeed()
 {
     ControlCommand command;
     command.action = ControlAction::RequestKeyFrame;
@@ -151,6 +151,33 @@ void testJsonPayloads()
     assert(format.has_value());
     assert(format->sps == std::vector<uint8_t>({1, 2, 3, 4}));
     assert(format->pps == std::vector<uint8_t>({5, 6}));
+    assert(format->vps.empty());
+
+    const std::string hevcJson =
+        R"({"codec":"hevc-hvcc","width":1920,"height":1080,"fps":60,"bitrate":8000000,"sps":"AQIDBA==","pps":"BQY=","vps":"Bwc="})";
+    auto hevc = parseFormatPayload(std::vector<uint8_t>(hevcJson.begin(), hevcJson.end()));
+    assert(hevc.has_value());
+    assert(hevc->codec == "hevc-hvcc");
+    assert(hevc->vps == std::vector<uint8_t>({7, 7}));
+    assert(hevc->sps == std::vector<uint8_t>({1, 2, 3, 4}));
+    assert(hevc->pps == std::vector<uint8_t>({5, 6}));
+}
+
+void testAudioPacketRoundTrip()
+{
+    CameraPacket packet;
+    packet.kind = PacketKind::Audio;
+    packet.streamId = 1;
+    packet.ptsNanos = 123456789ULL;
+    packet.payload = {0x11, 0x90, 0xaa, 0xbb};
+
+    const auto encoded = encodePacket(packet);
+    auto parsed = parsePacket(encoded.data(), encoded.size());
+    assert(parsed.has_value());
+    assert(parsed->kind == PacketKind::Audio);
+    assert(parsed->streamId == 1);
+    assert(parsed->ptsNanos == 123456789ULL);
+    assert(parsed->payload == packet.payload);
 }
 
 } // namespace
@@ -160,7 +187,8 @@ int main()
     testPacketRoundTrip();
     testControlPacket();
     testResetControlPayloadOmitsSpeed();
-    testKeyFrameRequestPayload();
+    testRequestKeyFrameControlPayloadOmitsSpeed();
+    testAudioPacketRoundTrip();
     testFrameReassembly();
     testStaleDrop();
     testJsonPayloads();

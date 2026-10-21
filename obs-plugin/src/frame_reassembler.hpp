@@ -11,12 +11,13 @@ namespace iphonecam {
 
 class FrameReassembler {
 public:
-    explicit FrameReassembler(std::chrono::milliseconds timeout = std::chrono::milliseconds(120));
+    explicit FrameReassembler(std::chrono::milliseconds timeout = std::chrono::milliseconds(80));
 
     std::optional<EncodedVideoFrame> accept(const CameraPacket &packet, std::chrono::steady_clock::time_point now);
     void reset();
 
     int droppedFrameCount() const { return droppedFrameCount_; }
+    uint64_t lastDeliveredFrameId() const { return lastDeliveredFrameId_; }
 
 private:
     struct PartialFrame {
@@ -33,6 +34,7 @@ private:
     std::chrono::milliseconds timeout_;
     std::map<uint64_t, PartialFrame> frames_;
     int droppedFrameCount_ = 0;
+    uint64_t lastDeliveredFrameId_ = 0;
 };
 
 } // namespace iphonecam

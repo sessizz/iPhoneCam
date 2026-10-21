@@ -31,8 +31,9 @@ public final class FrameReassembler {
     private var frames: [UInt64: PendingFrame] = [:]
 
     public private(set) var droppedFrameCount = 0
+    public private(set) var lastDeliveredFrameId: UInt64 = 0
 
-    public init(timeout: TimeInterval = 0.12) {
+    public init(timeout: TimeInterval = 0.08) {
         self.timeout = timeout
     }
 
@@ -44,6 +45,10 @@ public final class FrameReassembler {
         }
         guard packet.packetCount > 0, packet.packetIndex < packet.packetCount else {
             droppedFrameCount += 1
+            return nil
+        }
+
+        if lastDeliveredFrameId > 0 && packet.frameId <= lastDeliveredFrameId {
             return nil
         }
 
@@ -68,6 +73,8 @@ public final class FrameReassembler {
                         result.append(part)
                     }
                 }
+                lastDeliveredFrameId = frameId
+                pruneFramesOlderThan(frameId)
                 return EncodedVideoFrame(
                     streamId: pending.streamId,
                     frameId: pending.frameId,
@@ -92,6 +99,8 @@ public final class FrameReassembler {
             receivedCount: 1
         )
         if partCount == 1 {
+            lastDeliveredFrameId = frameId
+            pruneFramesOlderThan(frameId)
             return EncodedVideoFrame(
                 streamId: packet.streamId,
                 frameId: packet.frameId,
@@ -107,6 +116,15 @@ public final class FrameReassembler {
     public func reset() {
         frames.removeAll()
         droppedFrameCount = 0
+        lastDeliveredFrameId = 0
+    }
+
+    private func pruneFramesOlderThan(_ frameId: UInt64) {
+        let older = frames.keys.filter { $0 < frameId }
+        for oldId in older {
+            frames.removeValue(forKey: oldId)
+            droppedFrameCount += 1
+        }
     }
 
     private func cleanupStaleFrames(now: Date) {

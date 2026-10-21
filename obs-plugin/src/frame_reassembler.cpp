@@ -14,6 +14,10 @@ std::optional<EncodedVideoFrame> FrameReassembler::accept(const CameraPacket &pa
         return std::nullopt;
     }
 
+    if (lastDeliveredFrameId_ > 0 && packet.frameId <= lastDeliveredFrameId_) {
+        return std::nullopt;
+    }
+
     auto &partial = frames_[packet.frameId];
     if (partial.packetCount == 0) {
         partial.ptsNanos = packet.ptsNanos;
@@ -46,6 +50,17 @@ std::optional<EncodedVideoFrame> FrameReassembler::accept(const CameraPacket &pa
     for (const auto &fragment : partial.fragments)
         frame.data.insert(frame.data.end(), fragment.begin(), fragment.end());
     frames_.erase(packet.frameId);
+
+    lastDeliveredFrameId_ = packet.frameId;
+    for (auto it = frames_.begin(); it != frames_.end();) {
+        if (it->first < packet.frameId) {
+            it = frames_.erase(it);
+            droppedFrameCount_ += 1;
+        } else {
+            ++it;
+        }
+    }
+
     return frame;
 }
 
@@ -53,6 +68,7 @@ void FrameReassembler::reset()
 {
     frames_.clear();
     droppedFrameCount_ = 0;
+    lastDeliveredFrameId_ = 0;
 }
 
 void FrameReassembler::dropStale(std::chrono::steady_clock::time_point now)
