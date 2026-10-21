@@ -62,6 +62,7 @@ enum class ControlAction {
     ZoomOut,
     StopZoom,
     ResetZoom,
+    RequestKeyFrame,
 };
 
 enum class ControlSpeed {

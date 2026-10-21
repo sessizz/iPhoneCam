@@ -27,3 +27,5 @@ The plugin bundle is produced as `build/obs-plugin/iphonecam-obs.plugin`.
   `iPhoneCam: Reset Zoom` actions in OBS Settings > Hotkeys. Press-and-hold zoom keys ramp the iPhone lens;
   releasing the key stops the ramp.
 - FPS and bitrate are reported from the iPhone stream; OBS does not control the encoder yet.
+- After a lost frame or a decode error the source holds the last good frame and asks the iPhone for a keyframe
+  (at most every 250 ms) instead of decoding a broken reference chain.

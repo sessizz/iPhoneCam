@@ -80,8 +80,8 @@ final class CameraCaptureController: NSObject, ObservableObject, @unchecked Send
     @Published private(set) var activeLensText = "Lens: -"
     @Published private(set) var lensSwitchingText = "Lens switching: -"
     @Published private(set) var lensSwitchingMode: LensSwitchingMode = .locked
-    @Published private(set) var stabilizationMode: VideoStabilizationSetting = .standard
-    @Published private(set) var stabilizationModeText = "Stabilization: standard requested"
+    @Published private(set) var stabilizationMode: VideoStabilizationSetting = .off
+    @Published private(set) var stabilizationModeText = "Stabilization: off requested"
 
     let session = AVCaptureSession()
 
@@ -98,7 +98,7 @@ final class CameraCaptureController: NSObject, ObservableObject, @unchecked Send
     private var currentRotationAngle: CGFloat = 0
     private var displayZoomFactorMultiplier: CGFloat = 1
     private var requestedLensSwitchingMode: LensSwitchingMode = .locked
-    private var requestedStabilizationMode: VideoStabilizationSetting = .standard
+    private var requestedStabilizationMode: VideoStabilizationSetting = .off
     private var selectedFormatWarning: String?
     private var lastContinuousZoomIntensity: Double = 0
     private var lastContinuousZoomCommand = Date.distantPast
@@ -224,6 +224,12 @@ final class CameraCaptureController: NSObject, ObservableObject, @unchecked Send
             }
             self.applyLensSwitchingMode(on: device)
             self.updateZoomCapabilities(for: device)
+        }
+    }
+
+    func requestKeyFrame() {
+        sessionQueue.async { [weak self] in
+            self?.encoder?.requestKeyframe()
         }
     }
 

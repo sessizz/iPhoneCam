@@ -15,6 +15,7 @@ namespace {
 constexpr const char *kSettingReceiverName = "receiver_name";
 constexpr const char *kSettingLatency = "latency_ms";
 constexpr uint64_t kOneSecondNanos = 1000000000ULL;
+constexpr auto kKeyFrameRequestInterval = std::chrono::milliseconds(250);
 
 const char *packetKindName(PacketKind kind)
 {
@@ -45,11 +46,13 @@ std::string formatStats(const SourceStats &stats)
                   "Displayed Frames: %d\n"
                   "Network Dropped: %d\n"
                   "Decode Dropped: %d\n"
+                  "Keyframe Requests: %d\n"
                   "Waiting For Keyframe: %s\n"
                   "No Signal: black after 1s",
                   stats.status.c_str(), stats.deviceName.c_str(), stats.format.c_str(), stats.udpPort.c_str(),
                   stats.receivedFps, stats.displayedFps, stats.receivedFrames, stats.displayedFrames,
-                  stats.networkDroppedFrames, stats.decodeDroppedFrames, stats.waitingForKeyFrame ? "yes" : "no");
+                  stats.networkDroppedFrames, stats.decodeDroppedFrames, stats.keyFrameRequests,
+                  stats.waitingForKeyFrame ? "yes" : "no");
     return buffer;
 }
 
@@ -129,6 +132,7 @@ IPhoneCamSource::~IPhoneCamSource()
 {
     unregisterHotkeys();
     stopReceiver();
+    decodeGeneration_.fetch_add(1);
     dispatch_sync(decodeQueue_, ^{
       decoder_->reset();
       pendingDecodeFrames_ = 0;
@@ -260,6 +264,27 @@ void IPhoneCamSource::sendControlCommand(const ControlCommand &command)
         receiver_->sendControlCommand(command);
 }
 
+void IPhoneCamSource::requestKeyFrame()
+{
+    const auto now = std::chrono::steady_clock::now();
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (now - lastKeyFrameRequestAt_ < kKeyFrameRequestInterval)
+            return;
+        lastKeyFrameRequestAt_ = now;
+        stats_.keyFrameRequests += 1;
+        if (keyFrameRequestLogs_ < 10) {
+            blog(LOG_INFO, "[iPhoneCam] Requesting keyframe from iPhone");
+            keyFrameRequestLogs_ += 1;
+        }
+    }
+    markStatsDirty();
+
+    ControlCommand command;
+    command.action = ControlAction::RequestKeyFrame;
+    sendControlCommand(command);
+}
+
 void IPhoneCamSource::handleDatagram(const std::vector<uint8_t> &data)
 {
     auto packet = parsePacket(data.data(), data.size());
@@ -378,24 +403,46 @@ void IPhoneCamSource::handleFrame(const EncodedVideoFrame &frame)
         beginLatencyCatchUp();
 
     if (droppingUntilKeyFrame_.load()) {
-        if (!frame.isKeyFrame)
+        if (!frame.isKeyFrame) {
+            requestKeyFrame();
             return;
+        }
     }
 
+    // frameId is the iPhone's per-connection send sequence, so a non-keyframe only decodes cleanly when it
+    // directly follows the last frame queued for decode. Anything else means a frame was lost or dropped.
+    const bool continuesChain = frame.frameId == lastQueuedFrameId_ + 1;
+    bool needsKeyFrame = false;
     {
         std::lock_guard<std::mutex> lock(mutex_);
+        if (!frame.isKeyFrame && !continuesChain && !stats_.waitingForKeyFrame) {
+            if (frameGapLogs_ < 10) {
+                blog(LOG_WARNING, "[iPhoneCam] Frame %llu does not follow frame %llu, waiting for keyframe",
+                     static_cast<unsigned long long>(frame.frameId),
+                     static_cast<unsigned long long>(lastQueuedFrameId_));
+                frameGapLogs_ += 1;
+            }
+            stats_.waitingForKeyFrame = true;
+        }
         if (stats_.waitingForKeyFrame && !frame.isKeyFrame) {
             if (waitKeyFrameLogs_ < 10) {
                 blog(LOG_INFO, "[iPhoneCam] Completed non-keyframe %llu while waiting for keyframe",
                      static_cast<unsigned long long>(frame.frameId));
                 waitKeyFrameLogs_ += 1;
             }
-            return;
+            needsKeyFrame = true;
+        } else {
+            stats_.waitingForKeyFrame = false;
+            stats_.receivedFrames += 1;
+            receivedFramesSinceStats_ += 1;
         }
-        stats_.waitingForKeyFrame = false;
-        stats_.receivedFrames += 1;
-        receivedFramesSinceStats_ += 1;
     }
+    if (needsKeyFrame) {
+        markStatsDirty();
+        requestKeyFrame();
+        return;
+    }
+    lastQueuedFrameId_ = frame.frameId;
 
     auto *frameCopy = new EncodedVideoFrame(frame);
     const uint64_t generation = decodeGeneration_.load();
@@ -432,6 +479,7 @@ void IPhoneCamSource::decodeFrame(const EncodedVideoFrame &frame)
                 stats_.waitingForKeyFrame = true;
             }
             markStatsDirty();
+            requestKeyFrame();
             return;
         }
     }

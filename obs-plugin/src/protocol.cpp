@@ -144,6 +144,8 @@ const char *controlActionName(ControlAction action)
         return "stopZoom";
     case ControlAction::ResetZoom:
         return "resetZoom";
+    case ControlAction::RequestKeyFrame:
+        return "requestKeyFrame";
     }
     return "stopZoom";
 }

@@ -13,6 +13,7 @@ final class NetworkVideoSender: @unchecked Sendable {
     private var latestFormat: H264Format?
     private var sentFrames = 0
     private var sentBytes = 0
+    private var nextFrameSequence: UInt64 = 0
     private var lastStatsDate = Date()
     private var connectionAttemptId = UUID()
     private var receivingControlMessages = false
@@ -30,6 +31,7 @@ final class NetworkVideoSender: @unchecked Sendable {
             self.connectionAttemptId = attemptId
             self.connection?.cancel()
             self.receivingControlMessages = false
+            self.nextFrameSequence = 0
             let connection = NWConnection(to: endpoint, using: .udp)
             self.connection = connection
             connection.stateUpdateHandler = { [weak self] state in
@@ -56,14 +58,21 @@ final class NetworkVideoSender: @unchecked Sendable {
 
     func send(_ sample: EncodedH264Sample) {
         queue.async { [weak self] in
-            guard let self, self.ready else {
+            guard let self else {
+                return
+            }
+            // Every encoded frame takes a sequence number, so a frame that is not sent leaves a gap
+            // and the receiver knows to wait for the next keyframe instead of decoding a broken chain.
+            let sequence = self.nextFrameSequence
+            self.nextFrameSequence &+= 1
+            guard self.ready else {
                 return
             }
             if let format = sample.format {
                 self.latestFormat = format
                 self.sendFormatIfReady(format)
             }
-            self.sendFrame(sample)
+            self.sendFrame(sample, sequence: sequence)
         }
     }
 
@@ -73,6 +82,7 @@ final class NetworkVideoSender: @unchecked Sendable {
             self?.connection = nil
             self?.ready = false
             self?.receivingControlMessages = false
+            self?.nextFrameSequence = 0
             self?.sentFrames = 0
             self?.sentBytes = 0
             self?.lastStatsDate = Date()
@@ -154,7 +164,7 @@ final class NetworkVideoSender: @unchecked Sendable {
         sendDatagram(packet.encoded())
     }
 
-    private func sendFrame(_ sample: EncodedH264Sample) {
+    private func sendFrame(_ sample: EncodedH264Sample, sequence: UInt64) {
         let maxPayloadSize = CameraPacket.maxPayloadSize
         let packetCount = max(1, Int(ceil(Double(sample.data.count) / Double(maxPayloadSize))))
         guard packetCount <= Int(UInt16.max) else {
@@ -169,7 +179,7 @@ final class NetworkVideoSender: @unchecked Sendable {
                 kind: .frameFragment,
                 flags: sample.isKeyFrame ? .keyFrame : [],
                 streamId: CameraProtocol.streamId,
-                frameId: sample.frameId,
+                frameId: sequence,
                 ptsNanos: sample.ptsNanos,
                 packetIndex: UInt16(index),
                 packetCount: UInt16(packetCount),

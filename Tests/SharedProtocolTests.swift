@@ -34,6 +34,14 @@ final class SharedProtocolTests: XCTestCase {
         XCTAssertEqual(parsedPayload, payload)
     }
 
+    func testKeyFrameRequestDecodesOBSPayload() throws {
+        let data = Data(#"{"action":"requestKeyFrame"}"#.utf8)
+        let payload = try JSONDecoder().decode(CameraControlPayload.self, from: data)
+
+        XCTAssertEqual(payload.action, .requestKeyFrame)
+        XCTAssertNil(payload.speed)
+    }
+
     func testBLEJoystickPayloadDecode() throws {
         let data = Data([
             BLEZoomJoystickReport.version,

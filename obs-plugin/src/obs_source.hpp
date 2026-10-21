@@ -36,6 +36,7 @@ struct SourceStats {
     int displayedFrames = 0;
     int networkDroppedFrames = 0;
     int decodeDroppedFrames = 0;
+    int keyFrameRequests = 0;
     double receivedFps = 0;
     double displayedFps = 0;
     bool waitingForKeyFrame = true;
@@ -61,6 +62,7 @@ private:
     void registerHotkeys();
     void unregisterHotkeys();
     void sendControlCommand(const ControlCommand &command);
+    void requestKeyFrame();
     void handleDatagram(const std::vector<uint8_t> &data);
     void handleHello(const HelloPayload &hello);
     void handleFormat(const FormatPayload &format);
@@ -88,10 +90,12 @@ private:
     FrameReassembler reassembler_;
     std::chrono::steady_clock::time_point lastFrameAt_;
     std::chrono::steady_clock::time_point lastStatsAt_;
+    std::chrono::steady_clock::time_point lastKeyFrameRequestAt_;
     std::atomic<bool> statsDirty_ = true;
     std::atomic<int> pendingDecodeFrames_ = 0;
     std::atomic<uint64_t> decodeGeneration_ = 0;
     std::atomic<bool> droppingUntilKeyFrame_ = false;
+    uint64_t lastQueuedFrameId_ = 0;
     int receivedFramesSinceStats_ = 0;
     int displayedFramesSinceStats_ = 0;
     int invalidDatagramLogs_ = 0;
@@ -101,6 +105,8 @@ private:
     int decodeErrorLogs_ = 0;
     int completedFrameLogs_ = 0;
     int waitKeyFrameLogs_ = 0;
+    int frameGapLogs_ = 0;
+    int keyFrameRequestLogs_ = 0;
     int lastLoggedNetworkDrops_ = 0;
     int decodeAttemptLogs_ = 0;
     int outputFrameLogs_ = 0;

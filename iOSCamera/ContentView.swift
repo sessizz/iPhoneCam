@@ -460,7 +460,7 @@ final class CameraViewModel: ObservableObject {
     @Published var bleSpeedLabel = "Speed 0%"
     @Published var bleZoomSettings = BLEZoomSettings.defaults
     @Published var lensSwitchingMode: LensSwitchingMode = .locked
-    @Published var stabilizationMode: VideoStabilizationSetting = .standard
+    @Published var stabilizationMode: VideoStabilizationSetting = .off
     @Published var presetRampDuration = 1.2
 
     let capture = CameraCaptureController()
@@ -842,6 +842,8 @@ final class CameraViewModel: ObservableObject {
         case .resetZoom:
             remoteControlStatus = "OBS control: reset zoom"
             capture.rampZoom(to: 1, duration: presetRampDuration)
+        case .requestKeyFrame:
+            capture.requestKeyFrame()
         }
     }
 

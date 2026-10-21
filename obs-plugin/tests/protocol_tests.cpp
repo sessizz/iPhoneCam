@@ -70,6 +70,16 @@ void testResetControlPayloadOmitsSpeed()
     assert(json == R"({"action":"resetZoom"})");
 }
 
+void testKeyFrameRequestPayload()
+{
+    ControlCommand command;
+    command.action = ControlAction::RequestKeyFrame;
+
+    const auto payload = encodeControlPayload(command);
+    const std::string json(payload.begin(), payload.end());
+    assert(json == R"({"action":"requestKeyFrame"})");
+}
+
 void testFrameReassembly()
 {
     FrameReassembler reassembler(std::chrono::milliseconds(120));
@@ -150,6 +160,7 @@ int main()
     testPacketRoundTrip();
     testControlPacket();
     testResetControlPayloadOmitsSpeed();
+    testKeyFrameRequestPayload();
     testFrameReassembly();
     testStaleDrop();
     testJsonPayloads();

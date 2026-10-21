@@ -27,6 +27,8 @@ public struct CameraPacket: Equatable, Sendable {
     public let kind: CameraPacketKind
     public let flags: CameraPacketFlags
     public let streamId: UInt32
+    /// For frame fragments: a per-connection send sequence that goes up by one for every encoded frame,
+    /// so a gap means the receiver missed a frame and must wait for the next keyframe.
     public let frameId: UInt64
     public let ptsNanos: UInt64
     public let packetIndex: UInt16
@@ -152,6 +154,7 @@ public enum CameraControlAction: String, Codable, Equatable, Sendable {
     case zoomOut
     case stopZoom
     case resetZoom
+    case requestKeyFrame
 }
 
 public enum CameraControlSpeed: String, Codable, Equatable, Sendable {

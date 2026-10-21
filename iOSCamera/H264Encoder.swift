@@ -42,6 +42,10 @@ final class H264Encoder {
     private var compressionSession: VTCompressionSession?
     private var frameId: UInt64 = 0
     private var currentFormat: H264Format?
+    private let keyFrameRequestLock = NSLock()
+    private var keyFrameRequested = false
+    private var lastForcedKeyFrameDate = Date.distantPast
+    private let minimumForcedKeyFrameInterval: TimeInterval = 0.25
 
     init(width: Int, height: Int, fps: Int, bitrate: Int) {
         self.width = width
@@ -58,22 +62,44 @@ final class H264Encoder {
         }
     }
 
+    func requestKeyframe() {
+        keyFrameRequestLock.lock()
+        keyFrameRequested = true
+        keyFrameRequestLock.unlock()
+    }
+
     func encode(_ sampleBuffer: CMSampleBuffer) {
         guard let imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer), let compressionSession else {
             return
         }
         let presentationTime = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
         frameId &+= 1
+        let frameProperties: CFDictionary? = takeKeyFrameRequest()
+            ? [kVTEncodeFrameOptionKey_ForceKeyFrame: kCFBooleanTrue] as CFDictionary
+            : nil
         var flags = VTEncodeInfoFlags()
         VTCompressionSessionEncodeFrame(
             compressionSession,
             imageBuffer: imageBuffer,
             presentationTimeStamp: presentationTime,
             duration: CMTime(value: 1, timescale: CMTimeScale(fps)),
-            frameProperties: nil,
+            frameProperties: frameProperties,
             sourceFrameRefcon: UnsafeMutableRawPointer(bitPattern: Int(frameId)),
             infoFlagsOut: &flags
         )
+    }
+
+    // A request that arrives too soon after the last forced keyframe stays pending until the interval passes.
+    private func takeKeyFrameRequest() -> Bool {
+        keyFrameRequestLock.lock()
+        defer { keyFrameRequestLock.unlock() }
+        let now = Date()
+        guard keyFrameRequested, now.timeIntervalSince(lastForcedKeyFrameDate) >= minimumForcedKeyFrameInterval else {
+            return false
+        }
+        keyFrameRequested = false
+        lastForcedKeyFrameDate = now
+        return true
     }
 
     private func createSession() {
@@ -113,6 +139,10 @@ final class H264Encoder {
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxKeyFrameInterval, value: fps as CFTypeRef)
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_ExpectedFrameRate, value: fps as CFTypeRef)
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AverageBitRate, value: bitrate as CFTypeRef)
+        let peakBytesPerSecond = Double(bitrate) / 8 * 1.5
+        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_DataRateLimits, value: [peakBytesPerSecond, 1.0] as CFArray)
+        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality, value: kCFBooleanTrue)
+        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxFrameDelayCount, value: 1 as CFTypeRef)
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_ProfileLevel, value: kVTProfileLevel_H264_High_AutoLevel)
         VTCompressionSessionPrepareToEncodeFrames(session)
     }
