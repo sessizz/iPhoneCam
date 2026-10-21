@@ -6,21 +6,46 @@ final class H264SampleBuilder {
 
     init(format: FormatPayload) throws {
         var description: CMVideoFormatDescription?
-        let status = format.sps.withUnsafeBytes { spsBytes in
-            format.pps.withUnsafeBytes { ppsBytes in
-                let parameterSetPointers: [UnsafePointer<UInt8>] = [
-                    spsBytes.bindMemory(to: UInt8.self).baseAddress!,
-                    ppsBytes.bindMemory(to: UInt8.self).baseAddress!
-                ]
-                let parameterSetSizes = [format.sps.count, format.pps.count]
-                return CMVideoFormatDescriptionCreateFromH264ParameterSets(
-                    allocator: kCFAllocatorDefault,
-                    parameterSetCount: 2,
-                    parameterSetPointers: parameterSetPointers,
-                    parameterSetSizes: parameterSetSizes,
-                    nalUnitHeaderLength: 4,
-                    formatDescriptionOut: &description
-                )
+        let status: OSStatus
+        if format.codec == CameraProtocol.codecHEVCHVCC, let vps = format.vps {
+            status = vps.withUnsafeBytes { vpsBytes in
+                format.sps.withUnsafeBytes { spsBytes in
+                    format.pps.withUnsafeBytes { ppsBytes in
+                        let parameterSetPointers: [UnsafePointer<UInt8>] = [
+                            vpsBytes.bindMemory(to: UInt8.self).baseAddress!,
+                            spsBytes.bindMemory(to: UInt8.self).baseAddress!,
+                            ppsBytes.bindMemory(to: UInt8.self).baseAddress!
+                        ]
+                        let parameterSetSizes = [vps.count, format.sps.count, format.pps.count]
+                        return CMVideoFormatDescriptionCreateFromHEVCParameterSets(
+                            allocator: kCFAllocatorDefault,
+                            parameterSetCount: 3,
+                            parameterSetPointers: parameterSetPointers,
+                            parameterSetSizes: parameterSetSizes,
+                            nalUnitHeaderLength: 4,
+                            extensions: nil,
+                            formatDescriptionOut: &description
+                        )
+                    }
+                }
+            }
+        } else {
+            status = format.sps.withUnsafeBytes { spsBytes in
+                format.pps.withUnsafeBytes { ppsBytes in
+                    let parameterSetPointers: [UnsafePointer<UInt8>] = [
+                        spsBytes.bindMemory(to: UInt8.self).baseAddress!,
+                        ppsBytes.bindMemory(to: UInt8.self).baseAddress!
+                    ]
+                    let parameterSetSizes = [format.sps.count, format.pps.count]
+                    return CMVideoFormatDescriptionCreateFromH264ParameterSets(
+                        allocator: kCFAllocatorDefault,
+                        parameterSetCount: 2,
+                        parameterSetPointers: parameterSetPointers,
+                        parameterSetSizes: parameterSetSizes,
+                        nalUnitHeaderLength: 4,
+                        formatDescriptionOut: &description
+                    )
+                }
             }
         }
         guard status == noErr, let description else {
@@ -79,11 +104,11 @@ final class H264SampleBuilder {
         guard sampleStatus == noErr, let sampleBuffer else {
             throw H264SampleBuilderError.sampleBuffer(sampleStatus)
         }
-        markForImmediateDisplay(sampleBuffer)
+        markForImmediateDisplay(sampleBuffer, isKeyFrame: frame.isKeyFrame)
         return sampleBuffer
     }
 
-    private func markForImmediateDisplay(_ sampleBuffer: CMSampleBuffer) {
+    private func markForImmediateDisplay(_ sampleBuffer: CMSampleBuffer, isKeyFrame: Bool) {
         guard
             let attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: true),
             CFArrayGetCount(attachments) > 0
@@ -96,6 +121,13 @@ final class H264SampleBuilder {
             Unmanaged.passUnretained(kCMSampleAttachmentKey_DisplayImmediately).toOpaque(),
             Unmanaged.passUnretained(kCFBooleanTrue).toOpaque()
         )
+        if !isKeyFrame {
+            CFDictionarySetValue(
+                attachment,
+                Unmanaged.passUnretained(kCMSampleAttachmentKey_NotSync).toOpaque(),
+                Unmanaged.passUnretained(kCFBooleanTrue).toOpaque()
+            )
+        }
     }
 }
 

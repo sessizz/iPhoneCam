@@ -82,19 +82,31 @@ final class CameraCaptureController: NSObject, ObservableObject, @unchecked Send
     @Published private(set) var lensSwitchingMode: LensSwitchingMode = .locked
     @Published private(set) var stabilizationMode: VideoStabilizationSetting = .standard
     @Published private(set) var stabilizationModeText = "Stabilization: standard requested"
+    @Published private(set) var activeCodec: VideoCodecType = .hevc
+    @Published private(set) var droppedCaptureFrameCount: Int = 0
+    @Published private(set) var audioProfile: AudioProfile = .studio
+    @Published private(set) var isAudioMuted: Bool = false
+    @Published private(set) var audioLevel: Float = 0.0
+    @Published private(set) var audioStatusText = "Mic: active"
 
     let session = AVCaptureSession()
 
     var onFormat: ((H264Format) -> Void)?
     var onEncodedSample: ((EncodedH264Sample) -> Void)?
     var onPreviewSample: ((CMSampleBuffer) -> Void)?
+    var onAudioSample: ((EncodedAudioSample) -> Void)?
 
     private let sessionQueue = DispatchQueue(label: "iphonecam.capture.session")
+    private let audioQueue = DispatchQueue(label: "iphonecam.capture.audio")
     private var videoOutput: AVCaptureVideoDataOutput?
+    private var audioOutput: AVCaptureAudioDataOutput?
+    private var audioDeviceInput: AVCaptureDeviceInput?
+    private let audioEncoder = AudioEncoder()
     private var captureDevice: AVCaptureDevice?
     private var encoder: H264Encoder?
     private var zoomPollTimer: DispatchSourceTimer?
     private var configured = false
+    private var selectedCameraFormat: SelectedCameraFormat?
     private var currentRotationAngle: CGFloat = 0
     private var displayZoomFactorMultiplier: CGFloat = 1
     private var requestedLensSwitchingMode: LensSwitchingMode = .locked
@@ -108,11 +120,11 @@ final class CameraCaptureController: NSObject, ObservableObject, @unchecked Send
     func start() {
         switch AVCaptureDevice.authorizationStatus(for: .video) {
         case .authorized:
-            configureAndStart()
+            requestAudioAccessIfNeededAndStart()
         case .notDetermined:
             AVCaptureDevice.requestAccess(for: .video) { [weak self] granted in
                 if granted {
-                    self?.configureAndStart()
+                    self?.requestAudioAccessIfNeededAndStart()
                 } else {
                     DispatchQueue.main.async {
                         self?.statusText = "Camera permission denied"
@@ -124,11 +136,49 @@ final class CameraCaptureController: NSObject, ObservableObject, @unchecked Send
         }
     }
 
+    private func requestAudioAccessIfNeededAndStart() {
+        switch AVCaptureDevice.authorizationStatus(for: .audio) {
+        case .authorized:
+            configureAndStart()
+        case .notDetermined:
+            AVCaptureDevice.requestAccess(for: .audio) { [weak self] _ in
+                self?.configureAndStart()
+            }
+        default:
+            configureAndStart()
+        }
+    }
+
+    func setAudioProfile(_ profile: AudioProfile) {
+        audioProfile = profile
+        audioEncoder.setProfile(profile)
+        DispatchQueue.main.async { [weak self] in
+            self?.audioProfile = profile
+        }
+        sessionQueue.async { [weak self] in
+            self?.configureAudioSession(for: profile)
+        }
+    }
+
+    func setAudioMuted(_ muted: Bool) {
+        isAudioMuted = muted
+        audioEncoder.isMuted = muted
+        DispatchQueue.main.async { [weak self] in
+            self?.isAudioMuted = muted
+            self?.audioStatusText = muted ? "Mic: muted" : "Mic: active"
+        }
+    }
+
+    func toggleAudioMute() {
+        setAudioMuted(!isAudioMuted)
+    }
+
     func stop() {
         sessionQueue.async { [weak self] in
             self?.stopContinuousZoomOnQueue()
             self?.stopZoomPolling()
             self?.session.stopRunning()
+            self?.audioEncoder.reset()
         }
     }
 
@@ -243,17 +293,52 @@ final class CameraCaptureController: NSObject, ObservableObject, @unchecked Send
         }
     }
 
+    func requestKeyFrame() {
+        sessionQueue.async { [weak self] in
+            self?.encoder?.requestKeyFrame()
+        }
+    }
+
+    func setCodec(_ codec: VideoCodecType) {
+        sessionQueue.async { [weak self] in
+            guard let self else { return }
+            guard self.activeCodec != codec else { return }
+            self.activeCodec = codec
+            DispatchQueue.main.async {
+                self.activeCodec = codec
+            }
+            guard let selected = self.selectedCameraFormat else { return }
+            let encoder = H264Encoder(
+                codec: codec,
+                width: selected.width,
+                height: selected.height,
+                fps: selected.fps
+            )
+            encoder.onFormat = { [weak self] format in
+                self?.onFormat?(format)
+            }
+            encoder.onSample = { [weak self] sample in
+                self?.onEncodedSample?(sample)
+            }
+            self.encoder = encoder
+            DispatchQueue.main.async {
+                self.activeFormatText = "\(selected.width)x\(selected.height) @ \(selected.fps) FPS (\(codec.rawValue))"
+            }
+        }
+    }
+
     private func configureAndStart() {
         sessionQueue.async { [weak self] in
             guard let self else { return }
             do {
                 if !self.configured {
                     let selected = try self.configureSession()
+                    self.selectedCameraFormat = selected
                     let encoder = H264Encoder(
+                        codec: self.activeCodec,
                         width: selected.width,
                         height: selected.height,
-                        fps: selected.fps,
-                        bitrate: CameraProtocol.targetBitrate
+                        fps: selected.fps
                     )
                     encoder.onFormat = { [weak self] format in
                         self?.onFormat?(format)
@@ -262,9 +347,18 @@ final class CameraCaptureController: NSObject, ObservableObject, @unchecked Send
                         self?.onEncodedSample?(sample)
                     }
                     self.encoder = encoder
+                    self.audioEncoder.onSample = { [weak self] sample in
+                        self?.onAudioSample?(sample)
+                    }
+                    self.audioEncoder.onLevelUpdate = { [weak self] level in
+                        DispatchQueue.main.async {
+                            self?.audioLevel = level
+                        }
+                    }
                     self.configured = true
                     DispatchQueue.main.async { [weak self] in
-                        self?.activeFormatText = "\(selected.width)x\(selected.height) @ \(selected.fps) FPS"
+                        guard let self else { return }
+                        self.activeFormatText = "\(selected.width)x\(selected.height) @ \(selected.fps) FPS (\(self.activeCodec.rawValue))"
                     }
                 }
                 if let captureDevice {
@@ -316,12 +410,61 @@ final class CameraCaptureController: NSObject, ObservableObject, @unchecked Send
         session.addOutput(output)
         videoOutput = output
 
+        configureAudioSession(for: audioProfile)
+
+        if let audioDevice = AVCaptureDevice.default(for: .audio) {
+            do {
+                let aInput = try AVCaptureDeviceInput(device: audioDevice)
+                if session.canAddInput(aInput) {
+                    session.addInput(aInput)
+                    audioDeviceInput = aInput
+                }
+            } catch {
+                print("[Audio] Failed to add audio input: \(error)")
+            }
+        }
+
+        let aOutput = AVCaptureAudioDataOutput()
+        aOutput.setSampleBufferDelegate(self, queue: audioQueue)
+        if session.canAddOutput(aOutput) {
+            session.addOutput(aOutput)
+            audioOutput = aOutput
+        }
+
         applyCurrentRotation()
         setInitialZoom(on: device)
         applyLensSwitchingMode(on: device)
         updateZoomCapabilities(for: device)
 
         return selected
+    }
+
+    private func configureAudioSession(for profile: AudioProfile) {
+        let audioSession = AVAudioSession.sharedInstance()
+        do {
+            try audioSession.setCategory(
+                .record,
+                mode: profile.avAudioSessionMode,
+                options: [.allowBluetoothHFP]
+            )
+            try audioSession.setPreferredSampleRate(48000.0)
+            try audioSession.setPreferredIOBufferDuration(1024.0 / 48000.0)
+            if audioSession.maximumInputNumberOfChannels >= 2 {
+                try? audioSession.setPreferredInputNumberOfChannels(2)
+            }
+            if let dataSources = audioSession.inputDataSources {
+                for ds in dataSources {
+                    if let patterns = ds.supportedPolarPatterns, patterns.contains(.stereo) {
+                        try? ds.setPreferredPolarPattern(.stereo)
+                        try? audioSession.setInputDataSource(ds)
+                        break
+                    }
+                }
+            }
+            try audioSession.setActive(true, options: .notifyOthersOnDeactivation)
+        } catch {
+            print("[AudioSession] Setup error: \(error)")
+        }
     }
 
     private func applyCurrentRotation() {
@@ -700,11 +843,23 @@ final class CameraCaptureController: NSObject, ObservableObject, @unchecked Send
     }
 }
 
-extension CameraCaptureController: AVCaptureVideoDataOutputSampleBufferDelegate {
+extension CameraCaptureController: AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptureAudioDataOutputSampleBufferDelegate {
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
-        encoder?.encode(sampleBuffer)
-        onPreviewSample?(sampleBuffer)
-        publishStabilizationModeIfNeeded(for: connection)
+        if output == videoOutput {
+            encoder?.encode(sampleBuffer)
+            onPreviewSample?(sampleBuffer)
+            publishStabilizationModeIfNeeded(for: connection)
+        } else if output == audioOutput {
+            audioEncoder.encode(sampleBuffer: sampleBuffer)
+        }
+    }
+
+    func captureOutput(_ output: AVCaptureOutput, didDrop sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
+        if output == videoOutput {
+            DispatchQueue.main.async { [weak self] in
+                self?.droppedCaptureFrameCount += 1
+            }
+        }
     }
 }
 

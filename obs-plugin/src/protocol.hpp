@@ -12,6 +12,7 @@ enum class PacketKind : uint8_t {
     Format = 2,
     FrameFragment = 3,
     Control = 4,
+    Audio = 5,
 };
 
 constexpr uint32_t kPacketMagic = 0x4950434d;
@@ -40,6 +41,9 @@ struct HelloPayload {
     int bitrate = 0;
 };
 
+constexpr const char *kCodecH264AVCC = "h264-avcc";
+constexpr const char *kCodecHEVCHVCC = "hevc-hvcc";
+
 struct FormatPayload {
     std::string codec;
     int width = 0;
@@ -48,6 +52,7 @@ struct FormatPayload {
     int bitrate = 0;
     std::vector<uint8_t> sps;
     std::vector<uint8_t> pps;
+    std::vector<uint8_t> vps;
 };
 
 struct EncodedVideoFrame {
@@ -62,6 +67,7 @@ enum class ControlAction {
     ZoomOut,
     StopZoom,
     ResetZoom,
+    RequestKeyFrame,
 };
 
 enum class ControlSpeed {

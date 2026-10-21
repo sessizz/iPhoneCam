@@ -5,6 +5,7 @@ public enum CameraPacketKind: UInt8, Sendable {
     case format = 2
     case frameFragment = 3
     case control = 4
+    case audio = 5
 }
 
 public struct CameraPacketFlags: OptionSet, Sendable {
@@ -21,7 +22,7 @@ public struct CameraPacket: Equatable, Sendable {
     public static let magic: UInt32 = 0x4950434D
     public static let version: UInt8 = 1
     public static let headerLength = 36
-    public static let targetDatagramSize = 1_200
+    public static let targetDatagramSize = 1_400
     public static let maxPayloadSize = targetDatagramSize - headerLength
 
     public let kind: CameraPacketKind
@@ -135,8 +136,9 @@ public struct FormatPayload: Codable, Equatable, Sendable {
     public let bitrate: Int
     public let sps: Data
     public let pps: Data
+    public let vps: Data?
 
-    public init(codec: String, width: Int, height: Int, fps: Int, bitrate: Int, sps: Data, pps: Data) {
+    public init(codec: String, width: Int, height: Int, fps: Int, bitrate: Int, sps: Data, pps: Data, vps: Data? = nil) {
         self.codec = codec
         self.width = width
         self.height = height
@@ -144,6 +146,7 @@ public struct FormatPayload: Codable, Equatable, Sendable {
         self.bitrate = bitrate
         self.sps = sps
         self.pps = pps
+        self.vps = vps
     }
 }
 
@@ -152,6 +155,7 @@ public enum CameraControlAction: String, Codable, Equatable, Sendable {
     case zoomOut
     case stopZoom
     case resetZoom
+    case requestKeyFrame
 }
 
 public enum CameraControlSpeed: String, Codable, Equatable, Sendable {
@@ -174,11 +178,61 @@ public enum CameraProtocol {
     public static let serviceType = "_iphonecam._udp"
     public static let bonjourServiceType = "_iphonecam._udp."
     public static let codecH264AVCC = "h264-avcc"
+    public static let codecHEVCHVCC = "hevc-hvcc"
+    public static let defaultCodec = codecHEVCHVCC
     public static let streamId: UInt32 = 1
     public static let targetWidth = 1_920
     public static let targetHeight = 1_080
     public static let targetFPS = 60
-    public static let targetBitrate = 12_000_000
+    public static let targetBitrateH264 = 12_000_000
+    public static let targetBitrateHEVC = 8_000_000
+    public static let targetBitrate = 8_000_000
+    public static let usbMuxPort: UInt16 = 8240
+}
+
+extension CameraPacket {
+    public func framedForTCP() -> Data {
+        let raw = encoded()
+        var framed = Data()
+        framed.reserveCapacity(4 + raw.count)
+        var length = UInt32(raw.count).bigEndian
+        Swift.withUnsafeBytes(of: &length) { framed.append(contentsOf: $0) }
+        framed.append(raw)
+        return framed
+    }
+}
+
+public struct TCPPacketFramer: Sendable {
+    private var buffer = Data()
+
+    public init() {}
+
+    public mutating func append(_ data: Data) {
+        buffer.append(data)
+    }
+
+    public mutating func nextPacket() -> CameraPacket? {
+        while buffer.count >= 4 {
+            let length = (UInt32(buffer[0]) << 24)
+                | (UInt32(buffer[1]) << 16)
+                | (UInt32(buffer[2]) << 8)
+                | UInt32(buffer[3])
+            let totalLength = 4 + Int(length)
+            if buffer.count < totalLength {
+                return nil
+            }
+            let packetData = buffer.subdata(in: 4..<totalLength)
+            buffer.removeSubrange(0..<totalLength)
+            if let packet = CameraPacket(data: packetData) {
+                return packet
+            }
+        }
+        return nil
+    }
+
+    public mutating func reset() {
+        buffer.removeAll(keepingCapacity: true)
+    }
 }
 
 extension Data {

@@ -5,21 +5,15 @@ final class ReceiverPacketProcessor: @unchecked Sendable {
     var onFormat: ((FormatPayload) -> Void)?
     var onFrame: ((EncodedVideoFrame, Int) -> Void)?
 
-    private let queue = DispatchQueue(label: "iphonecam.receiver.packet.processor", qos: .userInitiated)
-    private let reassembler = FrameReassembler(timeout: 0.12)
+    private let reassembler = FrameReassembler(timeout: 0.25)
     private let decoder = JSONDecoder()
 
     func accept(_ packet: CameraPacket) {
-        queue.async { [weak self] in
-            guard let self else { return }
-            self.handle(packet)
-        }
+        handle(packet)
     }
 
     func reset() {
-        queue.async { [weak self] in
-            self?.reassembler.reset()
-        }
+        reassembler.reset()
     }
 
     private func handle(_ packet: CameraPacket) {
@@ -37,7 +31,7 @@ final class ReceiverPacketProcessor: @unchecked Sendable {
             if let frame = reassembler.accept(packet) {
                 onFrame?(frame, reassembler.droppedFrameCount)
             }
-        case .control:
+        case .control, .audio:
             break
         }
     }

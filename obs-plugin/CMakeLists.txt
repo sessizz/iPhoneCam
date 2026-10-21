@@ -64,6 +64,7 @@ if(APPLE AND IPHONECAM_BUILD_OBS_PLUGIN)
         src/obs_source.mm
         src/network_receiver.mm
         src/video_decoder.mm
+        src/audio_decoder.mm
     )
     target_include_directories(iphonecam-obs PRIVATE
         src
@@ -75,6 +76,7 @@ if(APPLE AND IPHONECAM_BUILD_OBS_PLUGIN)
         "${LIBOBS_FRAMEWORK}"
         "-framework Foundation"
         "-framework VideoToolbox"
+        "-framework AudioToolbox"
         "-framework CoreMedia"
         "-framework CoreVideo"
         "-framework CoreFoundation"

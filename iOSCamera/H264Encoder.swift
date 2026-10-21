@@ -2,23 +2,71 @@ import AVFoundation
 import Foundation
 import VideoToolbox
 
+enum VideoCodecType: String, CaseIterable, Identifiable, Sendable {
+    case hevc = "HEVC"
+    case h264 = "H.264"
+
+    var id: String { rawValue }
+
+    var cmCodecType: CMVideoCodecType {
+        switch self {
+        case .hevc:
+            return kCMVideoCodecType_HEVC
+        case .h264:
+            return kCMVideoCodecType_H264
+        }
+    }
+
+    var protocolCodec: String {
+        switch self {
+        case .hevc:
+            return CameraProtocol.codecHEVCHVCC
+        case .h264:
+            return CameraProtocol.codecH264AVCC
+        }
+    }
+
+    var defaultBitrate: Int {
+        switch self {
+        case .hevc:
+            return CameraProtocol.targetBitrateHEVC
+        case .h264:
+            return CameraProtocol.targetBitrateH264
+        }
+    }
+}
+
 struct H264Format: Equatable {
+    let codec: String
     let width: Int
     let height: Int
     let fps: Int
     let bitrate: Int
     let sps: Data
     let pps: Data
+    let vps: Data?
+
+    init(codec: String = CameraProtocol.codecH264AVCC, width: Int, height: Int, fps: Int, bitrate: Int, sps: Data, pps: Data, vps: Data? = nil) {
+        self.codec = codec
+        self.width = width
+        self.height = height
+        self.fps = fps
+        self.bitrate = bitrate
+        self.sps = sps
+        self.pps = pps
+        self.vps = vps
+    }
 
     var payload: FormatPayload {
         FormatPayload(
-            codec: CameraProtocol.codecH264AVCC,
+            codec: codec,
             width: width,
             height: height,
             fps: fps,
             bitrate: bitrate,
             sps: sps,
-            pps: pps
+            pps: pps,
+            vps: vps
         )
     }
 }
@@ -35,6 +83,7 @@ final class H264Encoder {
     var onFormat: ((H264Format) -> Void)?
     var onSample: ((EncodedH264Sample) -> Void)?
 
+    let codec: VideoCodecType
     private let width: Int
     private let height: Int
     private let fps: Int
@@ -42,12 +91,15 @@ final class H264Encoder {
     private var compressionSession: VTCompressionSession?
     private var frameId: UInt64 = 0
     private var currentFormat: H264Format?
+    private var forceNextKeyFrame = false
+    private var lastKeyFrameDate = Date.distantPast
 
-    init(width: Int, height: Int, fps: Int, bitrate: Int) {
+    init(codec: VideoCodecType = .hevc, width: Int, height: Int, fps: Int, bitrate: Int? = nil) {
+        self.codec = codec
         self.width = width
         self.height = height
         self.fps = fps
-        self.bitrate = bitrate
+        self.bitrate = bitrate ?? codec.defaultBitrate
         createSession()
     }
 
@@ -58,19 +110,36 @@ final class H264Encoder {
         }
     }
 
+    func requestKeyFrame() {
+        let now = Date()
+        guard now.timeIntervalSince(lastKeyFrameDate) >= 0.5 else {
+            return
+        }
+        forceNextKeyFrame = true
+    }
+
     func encode(_ sampleBuffer: CMSampleBuffer) {
         guard let imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer), let compressionSession else {
             return
         }
         let presentationTime = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+        let sampleDuration = CMSampleBufferGetDuration(sampleBuffer)
+        let duration = sampleDuration.isValid && sampleDuration.isNumeric ? sampleDuration : CMTime(value: 1, timescale: CMTimeScale(fps))
         frameId &+= 1
         var flags = VTEncodeInfoFlags()
+
+        var frameProperties: [CFString: Any]? = nil
+        if forceNextKeyFrame {
+            forceNextKeyFrame = false
+            frameProperties = [kVTEncodeFrameOptionKey_ForceKeyFrame: kCFBooleanTrue as Any]
+        }
+
         VTCompressionSessionEncodeFrame(
             compressionSession,
             imageBuffer: imageBuffer,
             presentationTimeStamp: presentationTime,
-            duration: CMTime(value: 1, timescale: CMTimeScale(fps)),
-            frameProperties: nil,
+            duration: duration,
+            frameProperties: frameProperties as CFDictionary?,
             sourceFrameRefcon: UnsafeMutableRawPointer(bitPattern: Int(frameId)),
             infoFlagsOut: &flags
         )
@@ -96,7 +165,7 @@ final class H264Encoder {
             allocator: kCFAllocatorDefault,
             width: Int32(width),
             height: Int32(height),
-            codecType: kCMVideoCodecType_H264,
+            codecType: codec.cmCodecType,
             encoderSpecification: nil,
             imageBufferAttributes: nil,
             compressedDataAllocator: nil,
@@ -110,10 +179,21 @@ final class H264Encoder {
         compressionSession = session
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_RealTime, value: kCFBooleanTrue)
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AllowFrameReordering, value: kCFBooleanFalse)
-        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxKeyFrameInterval, value: fps as CFTypeRef)
+        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxFrameDelayCount, value: 0 as CFTypeRef)
+        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxKeyFrameInterval, value: (fps * 3) as CFTypeRef)
+        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, value: 3.0 as CFTypeRef)
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_ExpectedFrameRate, value: fps as CFTypeRef)
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AverageBitRate, value: bitrate as CFTypeRef)
-        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_ProfileLevel, value: kVTProfileLevel_H264_High_AutoLevel)
+
+        let byteLimit = (bitrate * 3) / (2 * 8)
+        let dataRateLimits: [Any] = [byteLimit, 1.0]
+        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_DataRateLimits, value: dataRateLimits as CFArray)
+
+        if codec == .hevc {
+            VTSessionSetProperty(session, key: kVTCompressionPropertyKey_ProfileLevel, value: kVTProfileLevel_HEVC_Main_AutoLevel)
+        } else {
+            VTSessionSetProperty(session, key: kVTCompressionPropertyKey_ProfileLevel, value: kVTProfileLevel_H264_Main_AutoLevel)
+        }
         VTCompressionSessionPrepareToEncodeFrames(session)
     }
 
@@ -145,12 +225,16 @@ final class H264Encoder {
 
         let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
         let ptsNanos = UInt64(max(0, CMTimeConvertScale(pts, timescale: 1_000_000_000, method: .default).value))
+        let key = isKeyFrame(sampleBuffer)
+        if key {
+            lastKeyFrameDate = Date()
+        }
         let sample = EncodedH264Sample(
             frameId: frameId,
             ptsNanos: ptsNanos,
-            isKeyFrame: isKeyFrame(sampleBuffer),
+            isKeyFrame: key,
             data: data,
-            format: changedFormat
+            format: changedFormat ?? (key ? currentFormat : nil)
         )
         onSample?(sample)
     }
@@ -160,41 +244,96 @@ final class H264Encoder {
             return nil
         }
 
-        var spsPointer: UnsafePointer<UInt8>?
-        var spsSize = 0
-        var spsCount = 0
-        guard CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
-            description,
-            parameterSetIndex: 0,
-            parameterSetPointerOut: &spsPointer,
-            parameterSetSizeOut: &spsSize,
-            parameterSetCountOut: &spsCount,
-            nalUnitHeaderLengthOut: nil
-        ) == noErr, let spsPointer else {
-            return nil
-        }
+        if codec == .hevc {
+            var vpsPointer: UnsafePointer<UInt8>?
+            var vpsSize = 0
+            var spsPointer: UnsafePointer<UInt8>?
+            var spsSize = 0
+            var ppsPointer: UnsafePointer<UInt8>?
+            var ppsSize = 0
 
-        var ppsPointer: UnsafePointer<UInt8>?
-        var ppsSize = 0
-        guard CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
-            description,
-            parameterSetIndex: 1,
-            parameterSetPointerOut: &ppsPointer,
-            parameterSetSizeOut: &ppsSize,
-            parameterSetCountOut: nil,
-            nalUnitHeaderLengthOut: nil
-        ) == noErr, let ppsPointer else {
-            return nil
-        }
+            guard CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(
+                description,
+                parameterSetIndex: 0,
+                parameterSetPointerOut: &vpsPointer,
+                parameterSetSizeOut: &vpsSize,
+                parameterSetCountOut: nil,
+                nalUnitHeaderLengthOut: nil
+            ) == noErr, let vpsPointer else {
+                return nil
+            }
 
-        return H264Format(
-            width: width,
-            height: height,
-            fps: fps,
-            bitrate: bitrate,
-            sps: Data(bytes: spsPointer, count: spsSize),
-            pps: Data(bytes: ppsPointer, count: ppsSize)
-        )
+            guard CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(
+                description,
+                parameterSetIndex: 1,
+                parameterSetPointerOut: &spsPointer,
+                parameterSetSizeOut: &spsSize,
+                parameterSetCountOut: nil,
+                nalUnitHeaderLengthOut: nil
+            ) == noErr, let spsPointer else {
+                return nil
+            }
+
+            guard CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(
+                description,
+                parameterSetIndex: 2,
+                parameterSetPointerOut: &ppsPointer,
+                parameterSetSizeOut: &ppsSize,
+                parameterSetCountOut: nil,
+                nalUnitHeaderLengthOut: nil
+            ) == noErr, let ppsPointer else {
+                return nil
+            }
+
+            return H264Format(
+                codec: CameraProtocol.codecHEVCHVCC,
+                width: width,
+                height: height,
+                fps: fps,
+                bitrate: bitrate,
+                sps: Data(bytes: spsPointer, count: spsSize),
+                pps: Data(bytes: ppsPointer, count: ppsSize),
+                vps: Data(bytes: vpsPointer, count: vpsSize)
+            )
+        } else {
+            var spsPointer: UnsafePointer<UInt8>?
+            var spsSize = 0
+            var spsCount = 0
+            guard CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
+                description,
+                parameterSetIndex: 0,
+                parameterSetPointerOut: &spsPointer,
+                parameterSetSizeOut: &spsSize,
+                parameterSetCountOut: &spsCount,
+                nalUnitHeaderLengthOut: nil
+            ) == noErr, let spsPointer else {
+                return nil
+            }
+
+            var ppsPointer: UnsafePointer<UInt8>?
+            var ppsSize = 0
+            guard CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
+                description,
+                parameterSetIndex: 1,
+                parameterSetPointerOut: &ppsPointer,
+                parameterSetSizeOut: &ppsSize,
+                parameterSetCountOut: nil,
+                nalUnitHeaderLengthOut: nil
+            ) == noErr, let ppsPointer else {
+                return nil
+            }
+
+            return H264Format(
+                codec: CameraProtocol.codecH264AVCC,
+                width: width,
+                height: height,
+                fps: fps,
+                bitrate: bitrate,
+                sps: Data(bytes: spsPointer, count: spsSize),
+                pps: Data(bytes: ppsPointer, count: ppsSize),
+                vps: nil
+            )
+        }
     }
 
     private func isKeyFrame(_ sampleBuffer: CMSampleBuffer) -> Bool {

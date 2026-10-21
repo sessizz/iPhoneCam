@@ -23,6 +23,23 @@ final class SharedProtocolTests: XCTestCase {
         XCTAssertEqual(CameraPacket(data: encoded), packet)
     }
 
+    func testAudioPacketRoundTrip() throws {
+        let payload = Data([0x11, 0x90, 0xAA, 0xBB])
+        let packet = CameraPacket(
+            kind: .audio,
+            streamId: 1,
+            ptsNanos: 987654321,
+            payload: payload
+        )
+
+        let encoded = packet.encoded()
+        let parsed = try XCTUnwrap(CameraPacket(data: encoded))
+        XCTAssertEqual(parsed.kind, .audio)
+        XCTAssertEqual(parsed.streamId, 1)
+        XCTAssertEqual(parsed.ptsNanos, 987654321)
+        XCTAssertEqual(parsed.payload, payload)
+    }
+
     func testControlPayloadRoundTrip() throws {
         let payload = CameraControlPayload(action: .zoomIn, speed: .fast)
         let data = try JSONEncoder().encode(payload)
@@ -189,5 +206,67 @@ final class SharedProtocolTests: XCTestCase {
         XCTAssertNil(reassembler.accept(stale, now: Date(timeIntervalSince1970: 1)))
         XCTAssertNotNil(reassembler.accept(next, now: Date(timeIntervalSince1970: 1.2)))
         XCTAssertEqual(reassembler.droppedFrameCount, 1)
+    }
+
+    func testHEVCFormatPayloadRoundTrip() throws {
+        let vps = Data([0x01, 0x02])
+        let sps = Data([0x03, 0x04])
+        let pps = Data([0x05, 0x06])
+        let payload = FormatPayload(
+            codec: CameraProtocol.codecHEVCHVCC,
+            width: 1920,
+            height: 1080,
+            fps: 60,
+            bitrate: 8_000_000,
+            sps: sps,
+            pps: pps,
+            vps: vps
+        )
+        let data = try JSONEncoder().encode(payload)
+        let decoded = try JSONDecoder().decode(FormatPayload.self, from: data)
+
+        XCTAssertEqual(decoded.codec, CameraProtocol.codecHEVCHVCC)
+        XCTAssertEqual(decoded.vps, vps)
+        XCTAssertEqual(decoded.sps, sps)
+        XCTAssertEqual(decoded.pps, pps)
+        XCTAssertEqual(decoded.bitrate, 8_000_000)
+    }
+
+    func testTCPPacketFramerHandlesStreamedAndFragmentedPackets() {
+        var framer = TCPPacketFramer()
+
+        let packet1 = CameraPacket(
+            kind: .frameFragment,
+            flags: .keyFrame,
+            streamId: 1,
+            frameId: 10,
+            ptsNanos: 12345,
+            packetIndex: 0,
+            packetCount: 1,
+            payload: Data([0xAA, 0xBB, 0xCC, 0xDD])
+        )
+        let packet2 = CameraPacket(
+            kind: .control,
+            streamId: 1,
+            payload: Data([0x11, 0x22])
+        )
+
+        let framed1 = packet1.framedForTCP()
+        let framed2 = packet2.framedForTCP()
+
+        let mid = framed1.count / 2
+        framer.append(framed1.subdata(in: 0..<mid))
+        XCTAssertNil(framer.nextPacket())
+
+        framer.append(framed1.subdata(in: mid..<framed1.count))
+        framer.append(framed2)
+
+        let parsed1 = framer.nextPacket()
+        XCTAssertEqual(parsed1, packet1)
+
+        let parsed2 = framer.nextPacket()
+        XCTAssertEqual(parsed2, packet2)
+
+        XCTAssertNil(framer.nextPacket())
     }
 }

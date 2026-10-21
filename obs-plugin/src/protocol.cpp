@@ -144,6 +144,8 @@ const char *controlActionName(ControlAction action)
         return "stopZoom";
     case ControlAction::ResetZoom:
         return "resetZoom";
+    case ControlAction::RequestKeyFrame:
+        return "requestKeyFrame";
     }
     return "stopZoom";
 }
@@ -171,7 +173,7 @@ std::optional<CameraPacket> parsePacket(const uint8_t *data, size_t size)
         return std::nullopt;
 
     const auto rawKind = data[5];
-    if (rawKind < uint8_t(PacketKind::Hello) || rawKind > uint8_t(PacketKind::Control))
+    if (rawKind < uint8_t(PacketKind::Hello) || rawKind > uint8_t(PacketKind::Audio))
         return std::nullopt;
 
     const uint32_t payloadLength = readU32BE(data + 32);
@@ -265,6 +267,12 @@ std::optional<FormatPayload> parseFormatPayload(const std::vector<uint8_t> &payl
     format.bitrate = *bitrate;
     format.sps = std::move(*decodedSps);
     format.pps = std::move(*decodedPps);
+    auto vps = jsonString(json, "vps");
+    if (vps) {
+        auto decodedVps = decodeBase64(*vps);
+        if (decodedVps)
+            format.vps = std::move(*decodedVps);
+    }
     return format;
 }
 

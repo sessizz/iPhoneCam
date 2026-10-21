@@ -7,6 +7,8 @@ struct ContentView: View {
     @StateObject private var model = CameraViewModel()
     @State private var isInfoExpanded = false
     @State private var isBLESettingsPresented = false
+    @State private var isEditingCameraName = false
+    @State private var editedCameraName = ""
 
     var body: some View {
         GeometryReader { proxy in
@@ -59,26 +61,81 @@ struct ContentView: View {
                     .transition(.opacity.combined(with: .scale(scale: 0.96)))
             }
         }
+        .alert("Edit Camera Name", isPresented: $isEditingCameraName) {
+            TextField("Camera Name", text: $editedCameraName)
+            Button("Save") {
+                model.setCameraName(editedCameraName)
+            }
+            Button("Reset Default", role: .destructive) {
+                model.resetCameraName()
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Enter a unique name (e.g. iPhone 17, iPhone 11) to identify this phone in OBS Studio and macOS Receiver.")
+        }
     }
 
     private func infoPanel(compact: Bool, availableHeight: CGFloat) -> some View {
         let expandedWidth: CGFloat = compact ? 520 : 640
-        let collapsedWidth: CGFloat = 280
-        let expandedMaxHeight = max(compact ? 230 : 330, availableHeight - (compact ? 170 : 200))
-        let detailsMaxHeight = max(compact ? 116 : 180, expandedMaxHeight - (compact ? 70 : 82))
+        let collapsedWidth: CGFloat = compact ? 390 : 420
+        let expandedMaxHeight = max(compact ? 240 : 340, availableHeight - (compact ? 170 : 200))
+        let detailsMaxHeight = max(compact ? 120 : 190, expandedMaxHeight - (compact ? 70 : 82))
 
         return VStack(alignment: .leading, spacing: isInfoExpanded ? 8 : 0) {
-            HStack(alignment: .center, spacing: 12) {
+            HStack(alignment: .center, spacing: 8) {
                 Button {
                     withAnimation(.easeInOut(duration: 0.2)) {
                         isInfoExpanded.toggle()
                     }
                 } label: {
-                    Text("iPhoneCam")
-                        .font(.title3.weight(.semibold))
-                        .lineLimit(1)
+                    HStack(spacing: 6) {
+                        Text(model.cameraName)
+                            .font(.title3.weight(.semibold))
+                            .lineLimit(1)
+
+                        Text(model.activeCodec.rawValue)
+                            .font(.system(size: 10, weight: .bold, design: .monospaced))
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 3)
+                            .background(Color.blue.opacity(0.8), in: Capsule())
+
+                        HStack(spacing: 3) {
+                            Image(systemName: model.isUSBActive ? "cable.connector" : "wifi")
+                                .font(.system(size: 9, weight: .bold))
+                            Text(model.isUSBActive ? "USB" : "Wi-Fi")
+                                .font(.system(size: 10, weight: .bold, design: .monospaced))
+                        }
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 3)
+                        .background(model.isUSBActive ? Color.green.opacity(0.85) : Color.white.opacity(0.2), in: Capsule())
+                        .foregroundStyle(model.isUSBActive ? Color.black : Color.white)
+                    }
                 }
                 .buttonStyle(.plain)
+
+                Button {
+                    model.toggleAudioMute()
+                } label: {
+                    HStack(spacing: 5) {
+                        Image(systemName: model.capture.isAudioMuted ? "mic.slash.fill" : "mic.fill")
+                            .font(.system(size: 10, weight: .bold))
+                            .foregroundStyle(model.capture.isAudioMuted ? .red : .green)
+
+                        ZStack(alignment: .leading) {
+                            RoundedRectangle(cornerRadius: 1.5)
+                                .fill(Color.white.opacity(0.2))
+                            RoundedRectangle(cornerRadius: 1.5)
+                                .fill(model.capture.isAudioMuted ? Color.red : (model.capture.audioLevel > 0.8 ? Color.orange : Color.green))
+                                .frame(width: model.capture.isAudioMuted ? 0 : 22 * CGFloat(min(1.0, max(0.0, model.capture.audioLevel))))
+                        }
+                        .frame(width: 22, height: 4)
+                    }
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 4)
+                    .background(model.capture.isAudioMuted ? Color.red.opacity(0.25) : Color.white.opacity(0.15), in: Capsule())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(model.capture.isAudioMuted ? "Unmute Microphone" : "Mute Microphone")
 
                 Spacer(minLength: 8)
 
@@ -96,7 +153,99 @@ struct ContentView: View {
             if isInfoExpanded {
                 ScrollView(.vertical) {
                     VStack(alignment: .leading, spacing: 6) {
+                        HStack(alignment: .center) {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Device Name")
+                                    .font(.caption2)
+                                    .foregroundStyle(.white.opacity(0.6))
+                                Text(model.cameraName)
+                                    .font(.subheadline.weight(.bold))
+                                    .foregroundStyle(.white)
+                            }
+                            Spacer()
+                            Button {
+                                editedCameraName = model.cameraName
+                                isEditingCameraName = true
+                            } label: {
+                                HStack(spacing: 4) {
+                                    Image(systemName: "pencil")
+                                    Text("Edit")
+                                }
+                                .font(.caption.weight(.semibold))
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 5)
+                                .background(Color.white.opacity(0.2), in: Capsule())
+                                .foregroundStyle(.white)
+                            }
+                            .buttonStyle(.plain)
+                        }
+                        Divider()
+                            .overlay(.white.opacity(0.18))
                         Text(model.networkStatus)
+                        HStack(spacing: 4) {
+                            Text("Interface: \(model.activeInterface)")
+                                .foregroundStyle(model.isUSBActive ? .green : .white)
+                            if model.isUSBActive {
+                                Text("(High-Speed Cable)")
+                                    .font(.caption)
+                                    .foregroundStyle(.green)
+                            }
+                        }
+                        Divider()
+                            .overlay(.white.opacity(0.18))
+                        Text("Video Codec: \(model.activeCodec.rawValue)")
+                        codecPicker
+                        Divider()
+                            .overlay(.white.opacity(0.18))
+                        HStack(alignment: .center) {
+                            VStack(alignment: .leading, spacing: 2) {
+                                HStack(spacing: 5) {
+                                    Image(systemName: model.capture.isAudioMuted ? "mic.slash.fill" : "mic.fill")
+                                        .foregroundStyle(model.capture.isAudioMuted ? .red : .green)
+                                    Text("Audio: \(model.capture.audioProfile.rawValue)")
+                                        .font(.subheadline.weight(.semibold))
+                                }
+                                Text(model.capture.audioProfile.shortDescription)
+                                    .font(.caption2)
+                                    .foregroundStyle(.white.opacity(0.65))
+                            }
+                            Spacer()
+                            Button {
+                                model.toggleAudioMute()
+                            } label: {
+                                Text(model.capture.isAudioMuted ? "Unmute" : "Mute")
+                                    .font(.caption.weight(.bold))
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 4)
+                                    .background(model.capture.isAudioMuted ? Color.red.opacity(0.8) : Color.white.opacity(0.2), in: Capsule())
+                                    .foregroundStyle(.white)
+                            }
+                            .buttonStyle(.plain)
+                        }
+                        HStack(spacing: 8) {
+                            Text("VU")
+                                .font(.system(size: 10, weight: .bold, design: .monospaced))
+                                .foregroundStyle(.white.opacity(0.5))
+                            GeometryReader { vuGeo in
+                                ZStack(alignment: .leading) {
+                                    RoundedRectangle(cornerRadius: 3)
+                                        .fill(Color.white.opacity(0.15))
+                                    RoundedRectangle(cornerRadius: 3)
+                                        .fill(
+                                            LinearGradient(
+                                                colors: [.green, .yellow, .red],
+                                                startPoint: .leading,
+                                                endPoint: .trailing
+                                            )
+                                        )
+                                        .frame(width: model.capture.isAudioMuted ? 0 : vuGeo.size.width * CGFloat(min(1.0, max(0.0, model.capture.audioLevel))))
+                                }
+                            }
+                            .frame(height: 7)
+                        }
+                        audioProfilePicker
+                        Divider()
+                            .overlay(.white.opacity(0.18))
                         Text(model.remoteControlStatus)
                         Text(model.bleControlStatus)
                         Text(model.capture.statusText)
@@ -133,6 +282,31 @@ struct ContentView: View {
         .frame(maxWidth: isInfoExpanded ? expandedWidth : collapsedWidth)
         .background(.black.opacity(0.62), in: RoundedRectangle(cornerRadius: 8))
         .foregroundStyle(.white)
+    }
+
+    private var codecPicker: some View {
+        Picker("Codec", selection: Binding(
+            get: { model.activeCodec },
+            set: { model.setCodec($0) }
+        )) {
+            Text("HEVC (H.265)").tag(VideoCodecType.hevc)
+            Text("H.264").tag(VideoCodecType.h264)
+        }
+        .pickerStyle(.segmented)
+        .labelsHidden()
+    }
+
+    private var audioProfilePicker: some View {
+        Picker("Audio Profile", selection: Binding(
+            get: { model.capture.audioProfile },
+            set: { model.setAudioProfile($0) }
+        )) {
+            ForEach(AudioProfile.allCases) { profile in
+                Text(profile.rawValue).tag(profile)
+            }
+        }
+        .pickerStyle(.segmented)
+        .labelsHidden()
     }
 
     private var lensSwitchingPicker: some View {
@@ -449,6 +623,9 @@ final class CameraViewModel: ObservableObject {
         static let lensSwitchingMode = "camera.lensSwitchingMode"
         static let stabilizationMode = "camera.stabilizationMode"
         static let presetRampDuration = "camera.presetRampDuration"
+        static let videoCodec = "camera.videoCodec"
+        static let audioProfile = "camera.audioProfile"
+        static let isAudioMuted = "camera.isAudioMuted"
     }
 
     @Published var networkStatus = "Looking for Mac receiver..."
@@ -462,6 +639,10 @@ final class CameraViewModel: ObservableObject {
     @Published var lensSwitchingMode: LensSwitchingMode = .locked
     @Published var stabilizationMode: VideoStabilizationSetting = .standard
     @Published var presetRampDuration = 1.2
+    @Published var activeCodec: VideoCodecType = .hevc
+    @Published var activeInterface = "Detecting..."
+    @Published var isUSBActive = false
+    @Published var cameraName: String = DeviceIdentity.displayName
 
     let capture = CameraCaptureController()
     let previewRenderer = CameraPreviewRenderer()
@@ -528,6 +709,12 @@ final class CameraViewModel: ObservableObject {
                 self?.networkStatus = status
             }
         }
+        sender.onInterfaceChanged = { [weak self] description, isUSB in
+            Task { @MainActor in
+                self?.activeInterface = description
+                self?.isUSBActive = isUSB
+            }
+        }
         sender.onStatsChanged = { [weak self] stats in
             Task { @MainActor in
                 self?.senderStats = stats
@@ -537,6 +724,9 @@ final class CameraViewModel: ObservableObject {
             Task { @MainActor in
                 self?.handleRemoteControl(command)
             }
+        }
+        sender.onRequestKeyFrame = { [weak self] in
+            self?.capture.requestKeyFrame()
         }
         bleJoystick.onReport = { [weak self] report in
             Task { @MainActor in
@@ -566,7 +756,13 @@ final class CameraViewModel: ObservableObject {
         capture.onPreviewSample = { [weak self] sampleBuffer in
             self?.previewRenderer.display(sampleBuffer)
         }
+        capture.onAudioSample = { [weak self] sample in
+            self?.sender.sendAudio(sample)
+        }
 
+        sender.updateDeviceName(cameraName)
+        browser.myDeviceName = cameraName
+        sender.startUSBServer()
         browser.start()
         capture.start()
         bleJoystick.start()
@@ -578,6 +774,7 @@ final class CameraViewModel: ObservableObject {
         bleJoystick.stop()
         browser.stop()
         sender.stop()
+        sender.stopUSBServer()
         capture.stop()
         started = false
         restoreIdleTimer()
@@ -665,6 +862,26 @@ final class CameraViewModel: ObservableObject {
         setBLEZoomSettings(.defaults)
     }
 
+    func setCameraName(_ name: String) {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            resetCameraName()
+            return
+        }
+        DeviceIdentity.customName = trimmed
+        cameraName = trimmed
+        sender.updateDeviceName(trimmed)
+        browser.myDeviceName = trimmed
+    }
+
+    func resetCameraName() {
+        DeviceIdentity.customName = nil
+        let fallback = DeviceIdentity.displayName
+        cameraName = fallback
+        sender.updateDeviceName(fallback)
+        browser.myDeviceName = fallback
+    }
+
     func reconnect() {
         networkStatus = "Restarting connection..."
         senderStats = "0 frames sent"
@@ -735,6 +952,43 @@ final class CameraViewModel: ObservableObject {
         if defaults.object(forKey: SettingsKey.presetRampDuration) != nil {
             presetRampDuration = max(0.3, min(3.0, defaults.double(forKey: SettingsKey.presetRampDuration)))
         }
+
+        if
+            let rawCodec = defaults.string(forKey: SettingsKey.videoCodec),
+            let codec = VideoCodecType(rawValue: rawCodec)
+        {
+            activeCodec = codec
+            capture.setCodec(codec)
+        } else {
+            capture.setCodec(activeCodec)
+        }
+
+        if
+            let rawAudioProfile = defaults.string(forKey: SettingsKey.audioProfile),
+            let profile = AudioProfile(rawValue: rawAudioProfile)
+        {
+            capture.setAudioProfile(profile)
+        }
+
+        if defaults.object(forKey: SettingsKey.isAudioMuted) != nil {
+            capture.setAudioMuted(defaults.bool(forKey: SettingsKey.isAudioMuted))
+        }
+    }
+
+    func setCodec(_ codec: VideoCodecType) {
+        activeCodec = codec
+        UserDefaults.standard.set(codec.rawValue, forKey: SettingsKey.videoCodec)
+        capture.setCodec(codec)
+    }
+
+    func setAudioProfile(_ profile: AudioProfile) {
+        UserDefaults.standard.set(profile.rawValue, forKey: SettingsKey.audioProfile)
+        capture.setAudioProfile(profile)
+    }
+
+    func toggleAudioMute() {
+        capture.toggleAudioMute()
+        UserDefaults.standard.set(capture.isAudioMuted, forKey: SettingsKey.isAudioMuted)
     }
 
     private func setBLEZoomSettings(_ settings: BLEZoomSettings) {
@@ -842,6 +1096,8 @@ final class CameraViewModel: ObservableObject {
         case .resetZoom:
             remoteControlStatus = "OBS control: reset zoom"
             capture.rampZoom(to: 1, duration: presetRampDuration)
+        case .requestKeyFrame:
+            capture.requestKeyFrame()
         }
     }
 

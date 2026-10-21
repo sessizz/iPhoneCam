@@ -138,18 +138,34 @@ void VideoDecoder::reset()
 bool VideoDecoder::configure(const FormatPayload &format, std::string &error)
 {
     impl_->reset();
-    if (format.sps.empty() || format.pps.empty()) {
-        error = "Missing H.264 SPS/PPS";
-        return false;
-    }
+    OSStatus status = noErr;
+    if (format.codec == kCodecHEVCHVCC || !format.vps.empty()) {
+        if (format.vps.empty() || format.sps.empty() || format.pps.empty()) {
+            error = "Missing HEVC VPS/SPS/PPS";
+            return false;
+        }
+        const uint8_t *parameterSetPointers[] = {format.vps.data(), format.sps.data(), format.pps.data()};
+        const size_t parameterSetSizes[] = {format.vps.size(), format.sps.size(), format.pps.size()};
+        status = CMVideoFormatDescriptionCreateFromHEVCParameterSets(
+            kCFAllocatorDefault, 3, parameterSetPointers, parameterSetSizes, 4, nullptr, &impl_->formatDescription);
+        if (status != noErr || !impl_->formatDescription) {
+            error = statusError("CMVideoFormatDescriptionCreateFromHEVCParameterSets", status);
+            return false;
+        }
+    } else {
+        if (format.sps.empty() || format.pps.empty()) {
+            error = "Missing H.264 SPS/PPS";
+            return false;
+        }
 
-    const uint8_t *parameterSetPointers[] = {format.sps.data(), format.pps.data()};
-    const size_t parameterSetSizes[] = {format.sps.size(), format.pps.size()};
-    OSStatus status = CMVideoFormatDescriptionCreateFromH264ParameterSets(
-        kCFAllocatorDefault, 2, parameterSetPointers, parameterSetSizes, 4, &impl_->formatDescription);
-    if (status != noErr || !impl_->formatDescription) {
-        error = statusError("CMVideoFormatDescriptionCreateFromH264ParameterSets", status);
-        return false;
+        const uint8_t *parameterSetPointers[] = {format.sps.data(), format.pps.data()};
+        const size_t parameterSetSizes[] = {format.sps.size(), format.pps.size()};
+        status = CMVideoFormatDescriptionCreateFromH264ParameterSets(
+            kCFAllocatorDefault, 2, parameterSetPointers, parameterSetSizes, 4, &impl_->formatDescription);
+        if (status != noErr || !impl_->formatDescription) {
+            error = statusError("CMVideoFormatDescriptionCreateFromH264ParameterSets", status);
+            return false;
+        }
     }
 
     VTDecompressionOutputCallbackRecord callback = {};
@@ -213,11 +229,19 @@ bool VideoDecoder::decode(const EncodedVideoFrame &frame, DecodedFrame &decoded,
         return false;
     }
 
+    CFArrayRef attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, true);
+    if (attachments && CFArrayGetCount(attachments) > 0) {
+        CFMutableDictionaryRef dict = (CFMutableDictionaryRef)CFArrayGetValueAtIndex(attachments, 0);
+        CFDictionarySetValue(dict, kCMSampleAttachmentKey_DisplayImmediately, kCFBooleanTrue);
+        if (!frame.isKeyFrame) {
+            CFDictionarySetValue(dict, kCMSampleAttachmentKey_NotSync, kCFBooleanTrue);
+        }
+    }
+
     DecodeRequest request;
     request.decoded = &decoded;
     decoded.ptsNanos = frame.ptsNanos;
-    status = VTDecompressionSessionDecodeFrame(impl_->session, sampleBuffer, kVTDecodeFrame_1xRealTimePlayback, &request,
-                                               nullptr);
+    status = VTDecompressionSessionDecodeFrame(impl_->session, sampleBuffer, 0, &request, nullptr);
     CFRelease(sampleBuffer);
 
     if (status != noErr) {

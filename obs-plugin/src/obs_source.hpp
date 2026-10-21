@@ -1,5 +1,6 @@
 #pragma once
 
+#include "audio_decoder.hpp"
 #include "frame_reassembler.hpp"
 #include "network_receiver.hpp"
 #include "protocol.hpp"
@@ -24,11 +25,15 @@ namespace iphonecam {
 
 struct SourceSettings {
     std::string receiverName = "iPhoneCam OBS";
+    std::string targetDevice = "";
     int latencyMs = 0;
+    bool audioEnabled = true;
+    int audioOffsetMs = 0;
 };
 
 struct SourceStats {
     std::string status = "Waiting for iPhone";
+    std::string targetDevice = "Auto";
     std::string deviceName = "-";
     std::string format = "No stream";
     std::string udpPort = "-";
@@ -61,13 +66,18 @@ private:
     void registerHotkeys();
     void unregisterHotkeys();
     void sendControlCommand(const ControlCommand &command);
+    void requestKeyFrame();
     void handleDatagram(const std::vector<uint8_t> &data);
     void handleHello(const HelloPayload &hello);
     void handleFormat(const FormatPayload &format);
     void handleFrame(const EncodedVideoFrame &frame);
+    void handleAudio(const CameraPacket &packet);
     void decodeFrame(const EncodedVideoFrame &frame);
     void resetDecoder();
     void outputDecodedFrame(const DecodedFrame &frame);
+    void outputDecodedAudio(const DecodedAudioFrame &frame);
+    uint64_t getVideoObsTimestamp(uint64_t ptsNanos, int64_t offsetNs);
+    uint64_t getAudioObsTimestamp(uint64_t ptsNanos, int64_t offsetNs);
     void outputBlackFrame();
     void beginLatencyCatchUp();
     int maxPendingDecodeFrames() const;
@@ -81,6 +91,7 @@ private:
     SourceStats stats_;
     std::unique_ptr<NetworkReceiver> receiver_;
     std::unique_ptr<VideoDecoder> decoder_;
+    std::unique_ptr<AudioDecoder> audioDecoder_;
     std::vector<size_t> hotkeyIds_;
     std::optional<FormatPayload> lastFormat_;
     std::mutex decoderMutex_;
@@ -88,10 +99,12 @@ private:
     FrameReassembler reassembler_;
     std::chrono::steady_clock::time_point lastFrameAt_;
     std::chrono::steady_clock::time_point lastStatsAt_;
+    std::chrono::steady_clock::time_point lastKeyFrameRequestAt_{};
     std::atomic<bool> statsDirty_ = true;
     std::atomic<int> pendingDecodeFrames_ = 0;
     std::atomic<uint64_t> decodeGeneration_ = 0;
     std::atomic<bool> droppingUntilKeyFrame_ = false;
+    uint64_t lastReceivedFrameId_ = 0;
     int receivedFramesSinceStats_ = 0;
     int displayedFramesSinceStats_ = 0;
     int invalidDatagramLogs_ = 0;
@@ -99,6 +112,7 @@ private:
     int formatLogs_ = 0;
     int frameLogs_ = 0;
     int decodeErrorLogs_ = 0;
+    int audioErrorLogs_ = 0;
     int completedFrameLogs_ = 0;
     int waitKeyFrameLogs_ = 0;
     int lastLoggedNetworkDrops_ = 0;
@@ -108,6 +122,13 @@ private:
     uint32_t width_ = 1920;
     uint32_t height_ = 1080;
     bool noSignalOutput_ = false;
+    std::mutex timebaseMutex_;
+    uint64_t videoBaseObsTime_ = 0;
+    uint64_t videoBaseCameraPts_ = 0;
+    uint64_t lastVideoPts_ = 0;
+    uint64_t audioBaseObsTime_ = 0;
+    uint64_t audioBaseCameraPts_ = 0;
+    uint64_t lastAudioPts_ = 0;
 };
 
 } // namespace iphonecam
