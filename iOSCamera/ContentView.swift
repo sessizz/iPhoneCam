@@ -47,7 +47,7 @@ struct ContentView: View {
             }
         }
         .sheet(isPresented: $isFormatSheetPresented) {
-            FormatSheet(capture: model.capture, model: model)
+            FormatSheet(formatState: model.capture.formatState, model: model)
         }
         .task {
             model.start()
@@ -99,6 +99,8 @@ struct ContentView: View {
 
             CameraToolbar(
                 capture: model.capture,
+                formatState: model.capture.formatState,
+                controls: model.capture.controlsStore,
                 compact: compact,
                 tallyProgram: model.tallyProgram,
                 tallyPreview: model.tallyPreview,
@@ -114,7 +116,7 @@ struct ContentView: View {
             .padding(.trailing, compact ? 10 : 16)
 
             if isCameraControlsPresented {
-                CameraControlsPanel(capture: model.capture, compact: compact) {
+                CameraControlsPanel(capture: model.capture, store: model.capture.controlsStore, compact: compact) {
                     withAnimation(.easeInOut(duration: 0.18)) {
                         isCameraControlsPresented = false
                     }
@@ -271,7 +273,7 @@ struct ContentView: View {
                         Divider()
                             .overlay(.white.opacity(0.18))
                         HStack {
-                            Text("Format: \(model.capture.formatChoice.resolution.label) \(model.capture.formatChoice.fps) fps, \(model.activeCodec.rawValue), \(model.streamQuality.label)")
+                            Text("Format: \(model.capture.formatState.formatChoice.resolution.label) \(model.capture.formatState.formatChoice.fps) fps, \(model.activeCodec.rawValue), \(model.streamQuality.label)")
                                 .lineLimit(1)
                                 .minimumScaleFactor(0.7)
                             Spacer()
@@ -1110,14 +1112,14 @@ final class CameraViewModel: ObservableObject {
 
     /// Keeps the frame rate when the new resolution offers it, else the closest one below.
     func setResolution(_ resolution: StreamResolution) {
-        let rates = capture.supportedFrameRates[resolution] ?? []
-        let current = capture.formatChoice.fps
+        let rates = capture.formatState.supportedFrameRates[resolution] ?? []
+        let current = capture.formatState.formatChoice.fps
         let fps = rates.contains(current) ? current : (rates.last(where: { $0 <= current }) ?? rates.first ?? current)
         setFormat(CaptureFormatChoice(resolution: resolution, fps: fps))
     }
 
     func setFrameRate(_ fps: Int) {
-        setFormat(CaptureFormatChoice(resolution: capture.formatChoice.resolution, fps: fps))
+        setFormat(CaptureFormatChoice(resolution: capture.formatState.formatChoice.resolution, fps: fps))
     }
 
     func setCameraPosition(_ position: CameraPosition) {
@@ -1126,12 +1128,12 @@ final class CameraViewModel: ObservableObject {
     }
 
     func toggleCameraPosition() {
-        setCameraPosition(capture.cameraPosition == .back ? .front : .back)
+        setCameraPosition(capture.formatState.cameraPosition == .back ? .front : .back)
     }
 
     /// Maps a tap on the full-screen preview to a point in the picture, (0, 0) top-left; nil outside the picture.
     func picturePoint(for location: CGPoint, in size: CGSize) -> CGPoint? {
-        let resolution = capture.formatChoice.resolution
+        let resolution = capture.formatState.formatChoice.resolution
         let aspect = CGFloat(resolution.width) / CGFloat(resolution.height)
         var pictureSize = CGSize(width: size.width, height: size.width / aspect)
         if pictureSize.height > size.height {
@@ -1443,7 +1445,9 @@ private struct ZoomPresetButtonStyle: ButtonStyle {
 
 /// Right-edge buttons: format, image controls, torch, front/back.
 private struct CameraToolbar: View {
-    @ObservedObject var capture: CameraCaptureController
+    let capture: CameraCaptureController
+    @ObservedObject var formatState: CameraFormatState
+    @ObservedObject var controls: ImageControlsStore
     let compact: Bool
     let tallyProgram: Bool
     let tallyPreview: Bool
@@ -1466,9 +1470,9 @@ private struct CameraToolbar: View {
 
             Button(action: onFormat) {
                 VStack(spacing: 1) {
-                    Text(capture.formatChoice.resolution.label)
+                    Text(formatState.formatChoice.resolution.label)
                         .font(.caption.weight(.bold))
-                    Text("\(capture.formatChoice.fps) fps")
+                    Text("\(formatState.formatChoice.fps) fps")
                         .font(.caption2.monospacedDigit().weight(.semibold))
                         .foregroundStyle(.white.opacity(0.75))
                 }
@@ -1488,15 +1492,15 @@ private struct CameraToolbar: View {
             Button {
                 capture.toggleTorch()
             } label: {
-                Image(systemName: capture.imageControls.torchOn ? "flashlight.on.fill" : "flashlight.off.fill")
+                Image(systemName: controls.state.torchOn ? "flashlight.on.fill" : "flashlight.off.fill")
                     .font(.title3.weight(.semibold))
-                    .foregroundStyle(capture.imageControls.torchOn ? .yellow : .white)
+                    .foregroundStyle(controls.state.torchOn ? .yellow : .white)
                     .frame(width: 56, height: buttonHeight)
             }
             .buttonStyle(GlassIconButtonStyle())
-            .disabled(!capture.imageControls.hasTorch)
-            .opacity(capture.imageControls.hasTorch ? 1 : 0.35)
-            .accessibilityLabel(capture.imageControls.torchOn ? "Turn Flashlight Off" : "Turn Flashlight On")
+            .disabled(!controls.state.hasTorch)
+            .opacity(controls.state.hasTorch ? 1 : 0.35)
+            .accessibilityLabel(controls.state.torchOn ? "Turn Flashlight Off" : "Turn Flashlight On")
 
             Button(action: onToggleCamera) {
                 Image(systemName: "arrow.triangle.2.circlepath.camera")
@@ -1504,7 +1508,7 @@ private struct CameraToolbar: View {
                     .frame(width: 56, height: buttonHeight)
             }
             .buttonStyle(GlassIconButtonStyle())
-            .accessibilityLabel(capture.cameraPosition == .back ? "Switch to Front Camera" : "Switch to Back Camera")
+            .accessibilityLabel(formatState.cameraPosition == .back ? "Switch to Front Camera" : "Switch to Back Camera")
         }
         .padding(8)
         .background(.black.opacity(0.46), in: RoundedRectangle(cornerRadius: 8))
@@ -1527,16 +1531,16 @@ private struct TallyBorder: View {
 }
 
 private struct FormatSheet: View {
-    @ObservedObject var capture: CameraCaptureController
+    @ObservedObject var formatState: CameraFormatState
     @ObservedObject var model: CameraViewModel
     @Environment(\.dismiss) private var dismiss
 
     private var resolutions: [StreamResolution] {
-        StreamResolution.allCases.filter { !(capture.supportedFrameRates[$0] ?? []).isEmpty }
+        StreamResolution.allCases.filter { !(formatState.supportedFrameRates[$0] ?? []).isEmpty }
     }
 
     private var frameRates: [Int] {
-        capture.supportedFrameRates[capture.formatChoice.resolution] ?? [capture.formatChoice.fps]
+        formatState.supportedFrameRates[formatState.formatChoice.resolution] ?? [formatState.formatChoice.fps]
     }
 
     var body: some View {
@@ -1544,7 +1548,7 @@ private struct FormatSheet: View {
             Form {
                 Section {
                     Picker("Camera", selection: Binding(
-                        get: { capture.cameraPosition },
+                        get: { formatState.cameraPosition },
                         set: { model.setCameraPosition($0) }
                     )) {
                         ForEach(CameraPosition.allCases) { position in
@@ -1552,7 +1556,7 @@ private struct FormatSheet: View {
                         }
                     }
                     Picker("Resolution", selection: Binding(
-                        get: { capture.formatChoice.resolution },
+                        get: { formatState.formatChoice.resolution },
                         set: { model.setResolution($0) }
                     )) {
                         ForEach(resolutions) { resolution in
@@ -1560,7 +1564,7 @@ private struct FormatSheet: View {
                         }
                     }
                     Picker("Frame rate", selection: Binding(
-                        get: { capture.formatChoice.fps },
+                        get: { formatState.formatChoice.fps },
                         set: { model.setFrameRate($0) }
                     )) {
                         ForEach(frameRates, id: \.self) { fps in
@@ -1637,11 +1641,12 @@ private struct FormatSheet: View {
 }
 
 private struct CameraControlsPanel: View {
-    @ObservedObject var capture: CameraCaptureController
+    let capture: CameraCaptureController
+    @ObservedObject var store: ImageControlsStore
     let compact: Bool
     let onClose: () -> Void
 
-    private var controls: ImageControlsState { capture.imageControls }
+    private var controls: ImageControlsState { store.state }
 
     var body: some View {
         ZStack {
@@ -1777,7 +1782,7 @@ private struct CameraControlsPanel: View {
             sliderRow("Kelvin", trailing: "\(Int(controls.temperature)) K") {
                 LiveSlider(value: Double(controls.temperature), range: 2500...9000) { capture.setTemperature(Float($0)) }
             }
-            .disabled(!controls.supportsWhiteBalanceLock)
+            .disabled(!controls.supportsCustomWhiteBalance)
             Button {
                 capture.calibrateWhiteBalance()
             } label: {
@@ -1786,7 +1791,7 @@ private struct CameraControlsPanel: View {
                     .frame(maxWidth: .infinity, minHeight: 34)
             }
             .buttonStyle(GlassIconButtonStyle())
-            .disabled(!controls.supportsWhiteBalanceLock)
+            .disabled(!controls.supportsCustomWhiteBalance)
         }
     }
 

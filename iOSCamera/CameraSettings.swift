@@ -152,8 +152,24 @@ struct ImageControlsState: Equatable, Sendable {
     var whiteBalanceMode: WhiteBalanceControlMode = .auto
     var temperature: Float = 5000
     var supportsWhiteBalanceLock = false
+    /// Kelvin and gray-card calibration lock to custom gains, which some front cameras do not allow.
+    var supportsCustomWhiteBalance = false
 
     var hasTorch = false
     var torchOn = false
     var torchLevel: Float = 1
+}
+
+/// Format and camera state for the format sheet and toolbar, kept apart from the capture controller's
+/// fast-changing readings (zoom, audio level) so those do not re-render the menus while they are open.
+final class CameraFormatState: ObservableObject {
+    @Published var formatChoice = CaptureFormatChoice.standard
+    /// Frame rates the active camera offers per resolution.
+    @Published var supportedFrameRates: [StreamResolution: [Int]] = [:]
+    @Published var cameraPosition: CameraPosition = .back
+}
+
+/// The image controls panel's state, published at most twice a second and only when it changes.
+final class ImageControlsStore: ObservableObject {
+    @Published var state = ImageControlsState()
 }

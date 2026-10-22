@@ -88,11 +88,8 @@ final class CameraCaptureController: NSObject, ObservableObject, @unchecked Send
     @Published private(set) var isAudioMuted: Bool = false
     @Published private(set) var audioLevel: Float = 0.0
     @Published private(set) var audioStatusText = "Mic: active"
-    @Published private(set) var formatChoice = CaptureFormatChoice.standard
-    /// Frame rates the active camera offers per resolution.
-    @Published private(set) var supportedFrameRates: [StreamResolution: [Int]] = [:]
-    @Published private(set) var cameraPosition: CameraPosition = .back
-    @Published private(set) var imageControls = ImageControlsState()
+    let formatState = CameraFormatState()
+    let controlsStore = ImageControlsStore()
 
     let session = AVCaptureSession()
 
@@ -119,7 +116,12 @@ final class CameraCaptureController: NSObject, ObservableObject, @unchecked Send
     private var lockedWhiteBalanceGains: AVCaptureDevice.WhiteBalanceGains?
     private var zoomPollTicks = 0
     private var encoder: H264Encoder?
+    /// The session queue's copy of the codec; `activeCodec` is the main-thread one SwiftUI reads.
+    private var encoderCodec: VideoCodecType = .hevc
     private var activeQuality: StreamQuality = .balanced
+    /// What the video connection ended up applying, read back for mapping taps to sensor coordinates.
+    private var appliedRotationAngle: CGFloat = 0
+    private var appliedMirroring = false
     /// The adaptive bitrate loop's current target; nil until it speaks, which means the codec default.
     private var targetBitrate: Int?
     private var pressureObservation: NSKeyValueObservation?
@@ -321,8 +323,8 @@ final class CameraCaptureController: NSObject, ObservableObject, @unchecked Send
     func setCodec(_ codec: VideoCodecType) {
         sessionQueue.async { [weak self] in
             guard let self else { return }
-            guard self.activeCodec != codec else { return }
-            self.activeCodec = codec
+            guard self.encoderCodec != codec else { return }
+            self.encoderCodec = codec
             DispatchQueue.main.async {
                 self.activeCodec = codec
             }
@@ -358,7 +360,7 @@ final class CameraCaptureController: NSObject, ObservableObject, @unchecked Send
     private func rebuildEncoder() {
         guard let selected = selectedCameraFormat else { return }
         encoder = makeEncoder(for: selected)
-        let codec = activeCodec
+        let codec = encoderCodec
         DispatchQueue.main.async {
             self.activeFormatText = "\(selected.width)x\(selected.height) @ \(selected.fps) FPS (\(codec.rawValue))"
         }
@@ -366,7 +368,7 @@ final class CameraCaptureController: NSObject, ObservableObject, @unchecked Send
 
     private func makeEncoder(for selected: SelectedCameraFormat) -> H264Encoder {
         let encoder = H264Encoder(
-            codec: activeCodec,
+            codec: encoderCodec,
             quality: activeQuality,
             width: selected.width,
             height: selected.height,
@@ -415,9 +417,9 @@ final class CameraCaptureController: NSObject, ObservableObject, @unchecked Send
                         }
                     }
                     self.configured = true
+                    let codec = self.encoderCodec
                     DispatchQueue.main.async { [weak self] in
-                        guard let self else { return }
-                        self.activeFormatText = "\(selected.width)x\(selected.height) @ \(selected.fps) FPS (\(self.activeCodec.rawValue))"
+                        self?.activeFormatText = "\(selected.width)x\(selected.height) @ \(selected.fps) FPS (\(codec.rawValue))"
                     }
                 }
                 if let captureDevice {
@@ -534,13 +536,20 @@ final class CameraCaptureController: NSObject, ObservableObject, @unchecked Send
         guard let connection = videoOutput?.connection(with: .video) else {
             return
         }
-        if connection.isVideoRotationAngleSupported(currentRotationAngle) {
-            connection.videoRotationAngle = currentRotationAngle
+        // videoOrientation is relative to the phone, so it absorbs how each camera's sensor is mounted (the
+        // iPhone 17 front camera's square sensor sits a quarter turn off). Its replacement, videoRotationAngle,
+        // is relative to the sensor and would need that offset per model; this is the one deprecated call kept.
+        let orientation: AVCaptureVideoOrientation = currentRotationAngle == 180 ? .landscapeLeft : .landscapeRight
+        if connection.isVideoOrientationSupported {
+            connection.videoOrientation = orientation
         }
         if connection.isVideoMirroringSupported {
+            // The front camera streams mirrored, like a selfie view and like the person sees themselves.
             connection.automaticallyAdjustsVideoMirroring = false
-            connection.isVideoMirrored = false
+            connection.isVideoMirrored = captureDevice?.position == .front
         }
+        appliedRotationAngle = connection.videoRotationAngle
+        appliedMirroring = connection.isVideoMirrored
         applyVideoStabilization(on: connection)
     }
 
@@ -675,6 +684,14 @@ final class CameraCaptureController: NSObject, ObservableObject, @unchecked Send
             || subtype == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
     }
 
+    /// Formats with a dynamic aspect ratio (the iPhone 17 front camera's square sensor) start at the first ratio
+    /// they list, which can be portrait; the stream is landscape, so such a format must offer 16:9.
+    private static func offersLandscape(_ format: AVCaptureDevice.Format) -> Bool {
+        guard #available(iOS 26.0, *) else { return true }
+        let ratios = format.supportedDynamicAspectRatios
+        return ratios.isEmpty || ratios.contains(.ratio16x9)
+    }
+
     private static func supports(_ format: AVCaptureDevice.Format, fps: Int) -> Bool {
         format.videoSupportedFrameRateRanges.contains {
             $0.minFrameRate <= Double(fps) + 0.01 && $0.maxFrameRate >= Double(fps) - 0.01
@@ -683,7 +700,7 @@ final class CameraCaptureController: NSObject, ObservableObject, @unchecked Send
 
     static func supportedFrameRates(on device: AVCaptureDevice) -> [StreamResolution: [Int]] {
         var rates: [StreamResolution: Set<Int>] = [:]
-        for format in device.formats where isEightBit(format) {
+        for format in device.formats where isEightBit(format) && offersLandscape(format) {
             let dimensions = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
             guard let resolution = StreamResolution(width: dimensions.width, height: dimensions.height) else {
                 continue
@@ -715,6 +732,7 @@ final class CameraCaptureController: NSObject, ObservableObject, @unchecked Send
         let candidates = device.formats.filter { format in
             let dimensions = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
             return isEightBit(format)
+                && offersLandscape(format)
                 && Int(dimensions.width) == choice.resolution.width
                 && Int(dimensions.height) == choice.resolution.height
                 && supports(format, fps: choice.fps)
@@ -746,6 +764,10 @@ final class CameraCaptureController: NSObject, ObservableObject, @unchecked Send
         }
         try device.lockForConfiguration()
         device.activeFormat = format
+        if #available(iOS 26.0, *), !format.supportedDynamicAspectRatios.isEmpty {
+            // Otherwise the device starts at the format's first ratio, which turns the picture on its side.
+            device.setDynamicAspectRatio(.ratio16x9, completionHandler: nil)
+        }
         // Locked frame durations: a sagging cadence in low light would upset rate control and timing downstream,
         // so the image gets noisier instead.
         let frameDuration = CMTime(value: 1, timescale: CMTimeScale(resolved.fps))
@@ -760,10 +782,17 @@ final class CameraCaptureController: NSObject, ObservableObject, @unchecked Send
     private func publishCameraConfiguration(device: AVCaptureDevice, selected: SelectedCameraFormat) {
         let rates = Self.supportedFrameRates(on: device)
         let position = requestedPosition
-        DispatchQueue.main.async { [weak self] in
-            self?.formatChoice = selected.choice
-            self?.supportedFrameRates = rates
-            self?.cameraPosition = position
+        let formatState = formatState
+        DispatchQueue.main.async {
+            if formatState.formatChoice != selected.choice {
+                formatState.formatChoice = selected.choice
+            }
+            if formatState.supportedFrameRates != rates {
+                formatState.supportedFrameRates = rates
+            }
+            if formatState.cameraPosition != position {
+                formatState.cameraPosition = position
+            }
         }
         publishImageControls()
     }
@@ -1086,8 +1115,7 @@ extension CameraCaptureController {
     func focusAndExpose(at point: CGPoint) {
         sessionQueue.async { [weak self] in
             guard let self else { return }
-            // Point of interest coordinates follow the sensor, which matches the picture at 0° and is flipped at 180°.
-            let devicePoint = self.currentRotationAngle == 180 ? CGPoint(x: 1 - point.x, y: 1 - point.y) : point
+            let devicePoint = self.sensorPoint(forPicturePoint: point)
             self.requestedControls.focusMode = .auto
             self.lockedLensPosition = nil
             if self.requestedControls.exposureMode == .locked {
@@ -1103,6 +1131,22 @@ extension CameraCaptureController {
                 }
                 try self.applyExposure(on: device)
             }
+        }
+    }
+
+    /// Points of interest are in sensor coordinates; the picture is the sensor turned clockwise by the
+    /// connection's rotation angle and then mirrored for the front camera, so undo both.
+    private func sensorPoint(forPicturePoint picturePoint: CGPoint) -> CGPoint {
+        let point = appliedMirroring ? CGPoint(x: 1 - picturePoint.x, y: picturePoint.y) : picturePoint
+        switch (Int(appliedRotationAngle.rounded()) % 360 + 360) % 360 {
+        case 90:
+            return CGPoint(x: point.y, y: 1 - point.x)
+        case 180:
+            return CGPoint(x: 1 - point.x, y: 1 - point.y)
+        case 270:
+            return CGPoint(x: 1 - point.y, y: point.x)
+        default:
+            return point
         }
     }
 
@@ -1231,7 +1275,7 @@ extension CameraCaptureController {
         sessionQueue.async { [weak self] in
             guard let self else { return }
             if mode == .manual, self.requestedControls.whiteBalanceMode != .manual, let device = self.captureDevice {
-                self.requestedControls.temperature = device.temperatureAndTintValues(for: device.deviceWhiteBalanceGains).temperature
+                self.requestedControls.temperature = device.temperatureAndTintValues(for: Self.clamped(device.deviceWhiteBalanceGains, on: device)).temperature
             }
             self.requestedControls.whiteBalanceMode = mode
             self.lockedWhiteBalanceGains = nil
@@ -1282,6 +1326,8 @@ extension CameraCaptureController {
         }
     }
 
+    /// Gains outside [1, maxWhiteBalanceGain] make the white balance conversions raise NSRangeException, which
+    /// Swift cannot catch; current readings can be out of range while a camera is starting.
     private static func clamped(_ gains: AVCaptureDevice.WhiteBalanceGains, on device: AVCaptureDevice) -> AVCaptureDevice.WhiteBalanceGains {
         func clamp(_ value: Float) -> Float { min(max(value, 1), device.maxWhiteBalanceGain) }
         return AVCaptureDevice.WhiteBalanceGains(redGain: clamp(gains.redGain), greenGain: clamp(gains.greenGain), blueGain: clamp(gains.blueGain))
@@ -1409,14 +1455,16 @@ extension CameraCaptureController {
             state.shutterSeconds = shutter
         }
         state.supportsWhiteBalanceLock = device.isWhiteBalanceModeSupported(.locked)
+        state.supportsCustomWhiteBalance = device.isLockingWhiteBalanceWithCustomDeviceGainsSupported
         if requestedControls.whiteBalanceMode != .manual {
-            state.temperature = device.temperatureAndTintValues(for: device.deviceWhiteBalanceGains).temperature
+            state.temperature = device.temperatureAndTintValues(for: Self.clamped(device.deviceWhiteBalanceGains, on: device)).temperature
         }
         state.hasTorch = device.hasTorch && device.isTorchModeSupported(.on)
         state.torchOn = device.torchMode == .on
-        DispatchQueue.main.async { [weak self] in
-            guard let self, self.imageControls != state else { return }
-            self.imageControls = state
+        let store = controlsStore
+        DispatchQueue.main.async {
+            guard store.state != state else { return }
+            store.state = state
         }
     }
 }
