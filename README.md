@@ -55,3 +55,12 @@ See `obs-plugin/README.md` for build instructions. OBS and the Mac receiver can 
 ## BLE Zoom Joystick
 
 The iOS app can also listen for an ESP32-C3 BLE joystick. The firmware sketch is in `firmware/esp32_ble_zoom_joystick` and shows the current zoom factor plus joystick speed on the board OLED. See `firmware/README.md` for Arduino IDE setup and wiring.
+
+## License
+
+iPhoneCam is free software: you can redistribute it and/or modify it under the terms of the
+[GNU General Public License version 2](LICENSE), or (at your option) any later version — the same license as
+OBS Studio, whose `libobs` the OBS plugin links against.
+
+Parts of iPhoneCam are adapted from [LensLink](https://github.com/MyNamesEMurray/LensLink) (GPL-2.0-or-later);
+files that carry LensLink code say so in a header comment.
