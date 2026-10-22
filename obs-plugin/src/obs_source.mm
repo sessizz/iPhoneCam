@@ -140,6 +140,11 @@ void resetZoomHotkey(void *data, obs_hotkey_id, obs_hotkey_t *, bool pressed)
     static_cast<IPhoneCamSource *>(data)->handleResetZoomHotkey(pressed);
 }
 
+template <ControlAction Action> void actionHotkey(void *data, obs_hotkey_id, obs_hotkey_t *, bool pressed)
+{
+    static_cast<IPhoneCamSource *>(data)->handleActionHotkey(Action, pressed);
+}
+
 } // namespace
 
 IPhoneCamSource::IPhoneCamSource(obs_data_t *settings, obs_source_t *source)
@@ -206,6 +211,8 @@ void IPhoneCamSource::videoTick(float)
 {
     updateFpsCounters();
     sendTimeSyncRequest();
+    // Catches every way the source can go on or off air; only changes are sent.
+    updateTally(false);
     const auto now = std::chrono::steady_clock::now();
     if (now - lastFrameAt_ > std::chrono::seconds(1) && !noSignalOutput_) {
         outputBlackFrame();
@@ -265,6 +272,10 @@ void IPhoneCamSource::handleConnectionStatus(const std::string &status, const st
         }
     }
     markStatsDirty();
+    if (changed && connected) {
+        // The iPhone forgets the tally with every connection.
+        updateTally(true);
+    }
 }
 
 void IPhoneCamSource::sendTimeSyncRequest()
@@ -342,6 +353,16 @@ void IPhoneCamSource::registerHotkeys()
         {"iphonecam.zoom_out_medium", "iPhoneCam: Zoom Out Medium", zoomOutMediumHotkey},
         {"iphonecam.zoom_out_fast", "iPhoneCam: Zoom Out Fast", zoomOutFastHotkey},
         {"iphonecam.reset_zoom", "iPhoneCam: Reset Zoom", resetZoomHotkey},
+        {"iphonecam.toggle_torch", "iPhoneCam: Toggle Flashlight", actionHotkey<ControlAction::ToggleTorch>},
+        {"iphonecam.switch_camera", "iPhoneCam: Switch Front/Back Camera", actionHotkey<ControlAction::SwitchCamera>},
+        {"iphonecam.focus_exposure_lock", "iPhoneCam: Lock/Unlock Focus and Exposure",
+         actionHotkey<ControlAction::ToggleFocusExposureLock>},
+        {"iphonecam.exposure_up", "iPhoneCam: Exposure +", actionHotkey<ControlAction::ExposureUp>},
+        {"iphonecam.exposure_down", "iPhoneCam: Exposure -", actionHotkey<ControlAction::ExposureDown>},
+        {"iphonecam.white_balance_lock", "iPhoneCam: Lock/Unlock White Balance",
+         actionHotkey<ControlAction::ToggleWhiteBalanceLock>},
+        {"iphonecam.reset_image", "iPhoneCam: Focus, Exposure and White Balance to Auto",
+         actionHotkey<ControlAction::ResetImageControls>},
     };
 
     for (const auto &definition : definitions) {
@@ -376,6 +397,36 @@ void IPhoneCamSource::handleResetZoomHotkey(bool pressed)
 
     ControlCommand command;
     command.action = ControlAction::ResetZoom;
+    sendControlCommand(command);
+}
+
+void IPhoneCamSource::handleActionHotkey(ControlAction action, bool pressed)
+{
+    if (!pressed)
+        return;
+    ControlCommand command;
+    command.action = action;
+    sendControlCommand(command);
+}
+
+void IPhoneCamSource::updateTally(bool force)
+{
+    const bool program = obs_source_active(source_);
+    const bool preview = !program && obs_source_showing(source_);
+    {
+        std::lock_guard<std::mutex> lock(tallyMutex_);
+        if (!force && tallySent_ && program == tallyProgram_ && preview == tallyPreview_)
+            return;
+        tallySent_ = true;
+        tallyProgram_ = program;
+        tallyPreview_ = preview;
+    }
+    if (!connected_.load())
+        return;
+    ControlCommand command;
+    command.action = ControlAction::Tally;
+    command.program = program;
+    command.preview = preview;
     sendControlCommand(command);
 }
 
@@ -1038,6 +1089,12 @@ static void iphonecam_tick(void *data, float seconds)
     static_cast<IPhoneCamSource *>(data)->videoTick(seconds);
 }
 
+// Program/preview changes reach the iPhone at once instead of on the next tick.
+static void iphonecam_tally_changed(void *data)
+{
+    static_cast<IPhoneCamSource *>(data)->updateTally(false);
+}
+
 obs_source_info iphonecam_source_info = [] {
     obs_source_info info = {};
     info.id = "iphonecam_source";
@@ -1052,6 +1109,10 @@ obs_source_info iphonecam_source_info = [] {
     info.get_properties = iphonecam_properties;
     info.update = iphonecam_update;
     info.video_tick = iphonecam_tick;
+    info.activate = iphonecam_tally_changed;
+    info.deactivate = iphonecam_tally_changed;
+    info.show = iphonecam_tally_changed;
+    info.hide = iphonecam_tally_changed;
     info.icon_type = OBS_ICON_TYPE_CAMERA;
     return info;
 }();

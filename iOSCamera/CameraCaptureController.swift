@@ -88,6 +88,11 @@ final class CameraCaptureController: NSObject, ObservableObject, @unchecked Send
     @Published private(set) var isAudioMuted: Bool = false
     @Published private(set) var audioLevel: Float = 0.0
     @Published private(set) var audioStatusText = "Mic: active"
+    @Published private(set) var formatChoice = CaptureFormatChoice.standard
+    /// Frame rates the active camera offers per resolution.
+    @Published private(set) var supportedFrameRates: [StreamResolution: [Int]] = [:]
+    @Published private(set) var cameraPosition: CameraPosition = .back
+    @Published private(set) var imageControls = ImageControlsState()
 
     let session = AVCaptureSession()
 
@@ -105,6 +110,14 @@ final class CameraCaptureController: NSObject, ObservableObject, @unchecked Send
     private var audioDeviceInput: AVCaptureDeviceInput?
     private let audioEncoder = AudioEncoder()
     private var captureDevice: AVCaptureDevice?
+    private var videoInput: AVCaptureDeviceInput?
+    private var requestedChoice = CaptureFormatChoice.standard
+    private var requestedPosition: CameraPosition = .back
+    /// The modes and values the user asked for, re-applied after a format change resets the device.
+    private var requestedControls = ImageControlsState()
+    private var lockedLensPosition: Float?
+    private var lockedWhiteBalanceGains: AVCaptureDevice.WhiteBalanceGains?
+    private var zoomPollTicks = 0
     private var encoder: H264Encoder?
     private var activeQuality: StreamQuality = .balanced
     /// The adaptive bitrate loop's current target; nil until it speaks, which means the codec default.
@@ -431,9 +444,10 @@ final class CameraCaptureController: NSObject, ObservableObject, @unchecked Send
         session.sessionPreset = .inputPriority
         defer { session.commitConfiguration() }
 
-        let selection = try selectBackCamera()
-        let device = selection.device
-        let selected = selection.format
+        guard let device = Self.cameraDevices(for: requestedPosition).first else {
+            throw CameraCaptureError.noCamera
+        }
+        let selected = try applyFormat(requestedChoice, to: device)
         captureDevice = device
         observeSystemPressure(on: device)
         selectedFormatWarning = selected.warning
@@ -444,6 +458,7 @@ final class CameraCaptureController: NSObject, ObservableObject, @unchecked Send
             throw CameraCaptureError.cannotAddInput
         }
         session.addInput(input)
+        videoInput = input
 
         let output = AVCaptureVideoDataOutput()
         output.alwaysDiscardsLateVideoFrames = true
@@ -482,6 +497,7 @@ final class CameraCaptureController: NSObject, ObservableObject, @unchecked Send
         setInitialZoom(on: device)
         applyLensSwitchingMode(on: device)
         updateZoomCapabilities(for: device)
+        publishCameraConfiguration(device: device, selected: selected)
 
         return selected
     }
@@ -607,22 +623,11 @@ final class CameraCaptureController: NSObject, ObservableObject, @unchecked Send
         }
     }
 
-    private func selectBackCamera() throws -> (device: AVCaptureDevice, format: SelectedCameraFormat) {
-        let devices = Self.preferredBackCameras()
-        guard !devices.isEmpty else {
-            throw CameraCaptureError.noBackCamera
+    private static func cameraDevices(for position: CameraPosition) -> [AVCaptureDevice] {
+        guard position == .back else {
+            return [AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .front)].compactMap { $0 }
         }
-
-        for device in devices {
-            if let format = try? selectFormat(on: device) {
-                return (device, format)
-            }
-        }
-
-        throw CameraCaptureError.no1080pFormat
-    }
-
-    private static func preferredBackCameras() -> [AVCaptureDevice] {
+        // Virtual devices first: they move between lenses as the zoom changes.
         let preferredTypes: [AVCaptureDevice.DeviceType] = [
             .builtInTripleCamera,
             .builtInDualWideCamera,
@@ -663,37 +668,104 @@ final class CameraCaptureController: NSObject, ObservableObject, @unchecked Send
         }
     }
 
-    private func selectFormat(on device: AVCaptureDevice) throws -> SelectedCameraFormat {
-        let targetWidth = Int32(CameraProtocol.targetWidth)
-        let targetHeight = Int32(CameraProtocol.targetHeight)
+    /// The stream is 8-bit 4:2:0; formats are listed once per pixel format, so this skips the 10-bit duplicates.
+    private static func isEightBit(_ format: AVCaptureDevice.Format) -> Bool {
+        let subtype = CMFormatDescriptionGetMediaSubType(format.formatDescription)
+        return subtype == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
+            || subtype == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+    }
 
-        let matchingFormats = device.formats.compactMap { format -> (AVCaptureDevice.Format, Double)? in
+    private static func supports(_ format: AVCaptureDevice.Format, fps: Int) -> Bool {
+        format.videoSupportedFrameRateRanges.contains {
+            $0.minFrameRate <= Double(fps) + 0.01 && $0.maxFrameRate >= Double(fps) - 0.01
+        }
+    }
+
+    static func supportedFrameRates(on device: AVCaptureDevice) -> [StreamResolution: [Int]] {
+        var rates: [StreamResolution: Set<Int>] = [:]
+        for format in device.formats where isEightBit(format) {
             let dimensions = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
-            guard dimensions.width == targetWidth, dimensions.height == targetHeight else {
-                return nil
+            guard let resolution = StreamResolution(width: dimensions.width, height: dimensions.height) else {
+                continue
             }
-            let maxFPS = format.videoSupportedFrameRateRanges.map(\.maxFrameRate).max() ?? 0
-            guard maxFPS > 0 else {
-                return nil
+            for fps in CaptureFormatChoice.frameRates where supports(format, fps: fps) {
+                rates[resolution, default: []].insert(fps)
             }
-            return (format, maxFPS)
         }
+        return rates.mapValues { $0.sorted() }
+    }
 
-        guard let best = matchingFormats.sorted(by: { left, right in
-            abs(left.1 - Double(CameraProtocol.targetFPS)) < abs(right.1 - Double(CameraProtocol.targetFPS))
-        }).first else {
-            throw CameraCaptureError.no1080pFormat
+    /// The closest choice the camera can deliver: the requested resolution at the nearest frame rate not above
+    /// the request, else 1080p, else whatever it has.
+    static func resolve(_ choice: CaptureFormatChoice, within rates: [StreamResolution: [Int]]) -> CaptureFormatChoice? {
+        func pick(_ resolution: StreamResolution) -> CaptureFormatChoice? {
+            guard let available = rates[resolution], !available.isEmpty else { return nil }
+            if available.contains(choice.fps) {
+                return CaptureFormatChoice(resolution: resolution, fps: choice.fps)
+            }
+            let fps = available.last(where: { $0 <= choice.fps }) ?? available[0]
+            return CaptureFormatChoice(resolution: resolution, fps: fps)
         }
+        return pick(choice.resolution)
+            ?? pick(.hd1080)
+            ?? StreamResolution.allCases.lazy.compactMap(pick).first
+    }
 
-        let fps = Int(min(Double(CameraProtocol.targetFPS), best.1).rounded(.down))
+    private static func bestFormat(on device: AVCaptureDevice, for choice: CaptureFormatChoice) -> AVCaptureDevice.Format? {
+        let candidates = device.formats.filter { format in
+            let dimensions = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
+            return isEightBit(format)
+                && Int(dimensions.width) == choice.resolution.width
+                && Int(dimensions.height) == choice.resolution.height
+                && supports(format, fps: choice.fps)
+        }
+        // Full range matches the stream's pixel format; unbinned formats use the whole sensor; the lowest
+        // ceiling frame rate is the least compromised format that still reaches the request.
+        return candidates.min { left, right in
+            let leftKey = rankKey(left)
+            let rightKey = rankKey(right)
+            if leftKey.0 != rightKey.0 { return leftKey.0 < rightKey.0 }
+            if leftKey.1 != rightKey.1 { return leftKey.1 < rightKey.1 }
+            return leftKey.2 < rightKey.2
+        }
+    }
+
+    private static func rankKey(_ format: AVCaptureDevice.Format) -> (Int, Int, Double) {
+        let fullRange = CMFormatDescriptionGetMediaSubType(format.formatDescription) == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
+        let maxRate = format.videoSupportedFrameRateRanges.map(\.maxFrameRate).max() ?? 0
+        return (fullRange ? 0 : 1, format.isVideoBinned ? 1 : 0, maxRate)
+    }
+
+    /// Call inside a session configuration block.
+    private func applyFormat(_ choice: CaptureFormatChoice, to device: AVCaptureDevice) throws -> SelectedCameraFormat {
+        guard
+            let resolved = Self.resolve(choice, within: Self.supportedFrameRates(on: device)),
+            let format = Self.bestFormat(on: device, for: resolved)
+        else {
+            throw CameraCaptureError.noFormat
+        }
         try device.lockForConfiguration()
-        device.activeFormat = best.0
-        device.activeVideoMinFrameDuration = CMTime(value: 1, timescale: CMTimeScale(fps))
-        device.activeVideoMaxFrameDuration = CMTime(value: 1, timescale: CMTimeScale(fps))
+        device.activeFormat = format
+        // Locked frame durations: a sagging cadence in low light would upset rate control and timing downstream,
+        // so the image gets noisier instead.
+        let frameDuration = CMTime(value: 1, timescale: CMTimeScale(resolved.fps))
+        device.activeVideoMinFrameDuration = frameDuration
+        device.activeVideoMaxFrameDuration = frameDuration
         device.unlockForConfiguration()
 
-        let warning = fps == CameraProtocol.targetFPS ? nil : "1080p60 unsupported; using 1080p\(fps)."
-        return SelectedCameraFormat(width: CameraProtocol.targetWidth, height: CameraProtocol.targetHeight, fps: fps, warning: warning)
+        let warning = resolved == choice ? nil : "\(choice.label) unsupported on this camera; using \(resolved.label)."
+        return SelectedCameraFormat(choice: resolved, warning: warning)
+    }
+
+    private func publishCameraConfiguration(device: AVCaptureDevice, selected: SelectedCameraFormat) {
+        let rates = Self.supportedFrameRates(on: device)
+        let position = requestedPosition
+        DispatchQueue.main.async { [weak self] in
+            self?.formatChoice = selected.choice
+            self?.supportedFrameRates = rates
+            self?.cameraPosition = position
+        }
+        publishImageControls()
     }
 
     private func applyLensSwitchingMode(on device: AVCaptureDevice) {
@@ -763,6 +835,11 @@ final class CameraCaptureController: NSObject, ObservableObject, @unchecked Send
                 return
             }
             self.publishZoom(device.videoZoomFactor)
+            // Live readings (auto focus position, ISO, shutter, white balance) for the controls panel, twice a second.
+            self.zoomPollTicks += 1
+            if self.zoomPollTicks % 6 == 0 {
+                self.publishImageControls()
+            }
         }
         zoomPollTimer = timer
         timer.resume()
@@ -890,6 +967,460 @@ final class CameraCaptureController: NSObject, ObservableObject, @unchecked Send
     }
 }
 
+// MARK: - Format, camera and image controls
+
+extension CameraCaptureController {
+    func setFormat(_ choice: CaptureFormatChoice) {
+        sessionQueue.async { [weak self] in
+            guard let self else { return }
+            self.requestedChoice = choice
+            guard self.configured, let device = self.captureDevice else { return }
+            // A new active format resets the zoom, which on a multi-lens camera would jump to the ultra wide.
+            let zoom = device.videoZoomFactor
+            self.stopContinuousZoomOnQueue()
+            self.session.beginConfiguration()
+            let selected: SelectedCameraFormat
+            do {
+                selected = try self.applyFormat(choice, to: device)
+            } catch {
+                self.session.commitConfiguration()
+                self.publishWarning(error.localizedDescription)
+                return
+            }
+            self.session.commitConfiguration()
+            self.withDevice { device in
+                device.videoZoomFactor = min(max(zoom, device.minAvailableVideoZoomFactor), self.maximumDeviceZoomFactor(for: device))
+            }
+            self.applyLensSwitchingMode(on: device)
+            self.didChangeCameraOrFormat(device: device, selected: selected)
+        }
+    }
+
+    func setCameraPosition(_ position: CameraPosition) {
+        sessionQueue.async { [weak self] in
+            guard let self, self.requestedPosition != position else { return }
+            let previousPosition = self.requestedPosition
+            self.requestedPosition = position
+            guard self.configured, let oldInput = self.videoInput else { return }
+            guard let device = Self.cameraDevices(for: position).first else {
+                self.requestedPosition = previousPosition
+                self.publishWarning("This iPhone has no \(position.label.lowercased()) camera.")
+                return
+            }
+
+            self.stopContinuousZoomOnQueue()
+            self.session.beginConfiguration()
+            self.session.removeInput(oldInput)
+            do {
+                let selected = try self.applyFormat(self.requestedChoice, to: device)
+                let input = try AVCaptureDeviceInput(device: device)
+                guard self.session.canAddInput(input) else {
+                    throw CameraCaptureError.cannotAddInput
+                }
+                self.session.addInput(input)
+                self.session.commitConfiguration()
+
+                self.videoInput = input
+                self.captureDevice = device
+                self.observeSystemPressure(on: device)
+                self.displayZoomFactorMultiplier = Self.displayZoomFactorMultiplier(for: device)
+                // A different sensor: start from auto rather than carry over values measured on the old one.
+                self.requestedControls = ImageControlsState()
+                self.lockedLensPosition = nil
+                self.lockedWhiteBalanceGains = nil
+                self.setInitialZoom(on: device)
+                self.applyLensSwitchingMode(on: device)
+                self.didChangeCameraOrFormat(device: device, selected: selected)
+            } catch {
+                if self.session.canAddInput(oldInput) {
+                    self.session.addInput(oldInput)
+                }
+                self.session.commitConfiguration()
+                self.requestedPosition = previousPosition
+                self.publishWarning(error.localizedDescription)
+            }
+        }
+    }
+
+    /// Follow-up for a new camera or format: the encoder, rotation, zoom limits and the user's image settings all
+    /// depend on the active format.
+    private func didChangeCameraOrFormat(device: AVCaptureDevice, selected: SelectedCameraFormat) {
+        selectedCameraFormat = selected
+        selectedFormatWarning = selected.warning
+        // The sender starts a new bitrate budget for the new format and reports it.
+        targetBitrate = nil
+        rebuildEncoder()
+        applyCurrentRotation()
+        updateZoomCapabilities(for: device)
+        publishZoom(device.videoZoomFactor)
+        withDevice { device in
+            self.applyFocus(on: device)
+            try self.applyExposure(on: device)
+            self.applyWhiteBalance(on: device)
+            try self.applyTorch(on: device)
+        }
+        publishCameraConfiguration(device: device, selected: selected)
+    }
+
+    // MARK: Focus
+
+    func setFocusMode(_ mode: FocusControlMode) {
+        sessionQueue.async { [weak self] in
+            guard let self else { return }
+            self.requestedControls.focusMode = mode
+            self.lockedLensPosition = nil
+            self.withDevice { self.applyFocus(on: $0) }
+        }
+    }
+
+    func setLensPosition(_ position: Float) {
+        sessionQueue.async { [weak self] in
+            guard let self else { return }
+            self.requestedControls.focusMode = .locked
+            self.lockedLensPosition = min(max(position, 0), 1)
+            self.withDevice { self.applyFocus(on: $0) }
+        }
+    }
+
+    /// `point` is normalized in the streamed picture, (0, 0) at its top-left.
+    func focusAndExpose(at point: CGPoint) {
+        sessionQueue.async { [weak self] in
+            guard let self else { return }
+            // Point of interest coordinates follow the sensor, which matches the picture at 0° and is flipped at 180°.
+            let devicePoint = self.currentRotationAngle == 180 ? CGPoint(x: 1 - point.x, y: 1 - point.y) : point
+            self.requestedControls.focusMode = .auto
+            self.lockedLensPosition = nil
+            if self.requestedControls.exposureMode == .locked {
+                self.requestedControls.exposureMode = .auto
+            }
+            self.withDevice { device in
+                if device.isFocusPointOfInterestSupported {
+                    device.focusPointOfInterest = devicePoint
+                }
+                self.applyFocus(on: device)
+                if self.requestedControls.exposureMode == .auto, device.isExposurePointOfInterestSupported {
+                    device.exposurePointOfInterest = devicePoint
+                }
+                try self.applyExposure(on: device)
+            }
+        }
+    }
+
+    private func applyFocus(on device: AVCaptureDevice) {
+        switch requestedControls.focusMode {
+        case .auto:
+            if device.isFocusModeSupported(.continuousAutoFocus) {
+                device.focusMode = .continuousAutoFocus
+            }
+        case .locked:
+            if let lensPosition = lockedLensPosition, device.isLockingFocusWithCustomLensPositionSupported {
+                device.setFocusModeLocked(lensPosition: lensPosition, completionHandler: nil)
+            } else if device.isFocusModeSupported(.locked) {
+                // Lock where auto focus is now, and remember it for later re-applies.
+                lockedLensPosition = device.lensPosition
+                device.focusMode = .locked
+            }
+        }
+    }
+
+    // MARK: Exposure
+
+    func setExposureMode(_ mode: ExposureControlMode) {
+        sessionQueue.async { [weak self] in
+            guard let self else { return }
+            if mode == .manual {
+                self.seedManualExposureFromCamera()
+            }
+            self.requestedControls.exposureMode = mode
+            self.withDevice { try self.applyExposure(on: $0) }
+        }
+    }
+
+    func setExposureBias(_ bias: Float) {
+        sessionQueue.async { [weak self] in
+            guard let self else { return }
+            self.requestedControls.exposureBias = bias
+            self.withDevice { self.applyExposureBias(on: $0) }
+        }
+    }
+
+    func setISO(_ iso: Float) {
+        sessionQueue.async { [weak self] in
+            guard let self else { return }
+            self.seedManualExposureFromCamera()
+            self.requestedControls.exposureMode = .manual
+            self.requestedControls.iso = iso
+            self.withDevice { try self.applyExposure(on: $0) }
+        }
+    }
+
+    func setShutter(seconds: Double) {
+        sessionQueue.async { [weak self] in
+            guard let self else { return }
+            self.seedManualExposureFromCamera()
+            self.requestedControls.exposureMode = .manual
+            self.requestedControls.shutterSeconds = seconds
+            self.withDevice { try self.applyExposure(on: $0) }
+        }
+    }
+
+    /// One third of a stop per step: exposure bias in auto, ISO in manual.
+    func adjustExposure(steps: Int) {
+        sessionQueue.async { [weak self] in
+            guard let self, let device = self.captureDevice else { return }
+            if self.requestedControls.exposureMode == .manual {
+                let iso = self.requestedControls.iso * pow(2, Float(steps) / 3)
+                self.requestedControls.iso = min(max(iso, device.activeFormat.minISO), device.activeFormat.maxISO)
+                self.withDevice { try self.applyExposure(on: $0) }
+            } else {
+                let bias = self.requestedControls.exposureBias + Float(steps) / 3
+                self.requestedControls.exposureBias = min(max(bias, -3), 3)
+                self.withDevice { self.applyExposureBias(on: $0) }
+            }
+        }
+    }
+
+    /// Manual starts from what auto exposure was doing, so switching to it does not jump the picture.
+    private func seedManualExposureFromCamera() {
+        guard requestedControls.exposureMode != .manual, let device = captureDevice else { return }
+        requestedControls.iso = device.iso
+        let seconds = device.exposureDuration.seconds
+        if seconds.isFinite, seconds > 0 {
+            requestedControls.shutterSeconds = seconds
+        }
+    }
+
+    private func longestShutterSeconds(on device: AVCaptureDevice) -> Double {
+        // Anything longer than a frame would slow the frame rate.
+        let frame = 1.0 / Double(selectedCameraFormat?.fps ?? 30)
+        return max(device.activeFormat.minExposureDuration.seconds, min(device.activeFormat.maxExposureDuration.seconds, frame))
+    }
+
+    private func applyExposure(on device: AVCaptureDevice) throws {
+        switch requestedControls.exposureMode {
+        case .auto:
+            if device.isExposureModeSupported(.continuousAutoExposure) {
+                device.exposureMode = .continuousAutoExposure
+            }
+        case .locked:
+            if device.isExposureModeSupported(.locked) {
+                device.exposureMode = .locked
+            }
+        case .manual:
+            guard device.isExposureModeSupported(.custom) else { return }
+            let format = device.activeFormat
+            let iso = min(max(requestedControls.iso, format.minISO), format.maxISO)
+            let shutter = min(max(requestedControls.shutterSeconds, format.minExposureDuration.seconds), longestShutterSeconds(on: device))
+            device.setExposureModeCustom(
+                duration: CMTime(seconds: shutter, preferredTimescale: 1_000_000_000),
+                iso: iso,
+                completionHandler: nil
+            )
+        }
+        applyExposureBias(on: device)
+    }
+
+    private func applyExposureBias(on device: AVCaptureDevice) {
+        let bias = min(max(requestedControls.exposureBias, device.minExposureTargetBias), device.maxExposureTargetBias)
+        device.setExposureTargetBias(bias, completionHandler: nil)
+    }
+
+    // MARK: White balance
+
+    func setWhiteBalanceMode(_ mode: WhiteBalanceControlMode) {
+        sessionQueue.async { [weak self] in
+            guard let self else { return }
+            if mode == .manual, self.requestedControls.whiteBalanceMode != .manual, let device = self.captureDevice {
+                self.requestedControls.temperature = device.temperatureAndTintValues(for: device.deviceWhiteBalanceGains).temperature
+            }
+            self.requestedControls.whiteBalanceMode = mode
+            self.lockedWhiteBalanceGains = nil
+            self.withDevice { self.applyWhiteBalance(on: $0) }
+        }
+    }
+
+    func setTemperature(_ kelvin: Float) {
+        sessionQueue.async { [weak self] in
+            guard let self else { return }
+            self.requestedControls.whiteBalanceMode = .manual
+            self.requestedControls.temperature = kelvin
+            self.withDevice { self.applyWhiteBalance(on: $0) }
+        }
+    }
+
+    /// Locks white balance so the scene averages to neutral: point the camera at white paper or a gray card first.
+    func calibrateWhiteBalance() {
+        sessionQueue.async { [weak self] in
+            guard let self else { return }
+            self.withDevice { device in
+                guard device.isLockingWhiteBalanceWithCustomDeviceGainsSupported else { return }
+                let gains = Self.clamped(device.grayWorldDeviceWhiteBalanceGains, on: device)
+                self.lockedWhiteBalanceGains = gains
+                self.requestedControls.whiteBalanceMode = .locked
+                device.setWhiteBalanceModeLocked(with: gains, completionHandler: nil)
+            }
+        }
+    }
+
+    private func applyWhiteBalance(on device: AVCaptureDevice) {
+        switch requestedControls.whiteBalanceMode {
+        case .auto:
+            if device.isWhiteBalanceModeSupported(.continuousAutoWhiteBalance) {
+                device.whiteBalanceMode = .continuousAutoWhiteBalance
+            }
+        case .locked:
+            if let gains = lockedWhiteBalanceGains, device.isLockingWhiteBalanceWithCustomDeviceGainsSupported {
+                device.setWhiteBalanceModeLocked(with: Self.clamped(gains, on: device), completionHandler: nil)
+            } else if device.isWhiteBalanceModeSupported(.locked) {
+                lockedWhiteBalanceGains = device.deviceWhiteBalanceGains
+                device.whiteBalanceMode = .locked
+            }
+        case .manual:
+            guard device.isLockingWhiteBalanceWithCustomDeviceGainsSupported else { return }
+            let values = AVCaptureDevice.WhiteBalanceTemperatureAndTintValues(temperature: requestedControls.temperature, tint: 0)
+            device.setWhiteBalanceModeLocked(with: Self.clamped(device.deviceWhiteBalanceGains(for: values), on: device), completionHandler: nil)
+        }
+    }
+
+    private static func clamped(_ gains: AVCaptureDevice.WhiteBalanceGains, on device: AVCaptureDevice) -> AVCaptureDevice.WhiteBalanceGains {
+        func clamp(_ value: Float) -> Float { min(max(value, 1), device.maxWhiteBalanceGain) }
+        return AVCaptureDevice.WhiteBalanceGains(redGain: clamp(gains.redGain), greenGain: clamp(gains.greenGain), blueGain: clamp(gains.blueGain))
+    }
+
+    // MARK: Torch
+
+    func setTorch(on: Bool) {
+        sessionQueue.async { [weak self] in
+            guard let self else { return }
+            self.requestedControls.torchOn = on
+            self.withDevice { try self.applyTorch(on: $0) }
+        }
+    }
+
+    func setTorchLevel(_ level: Float) {
+        sessionQueue.async { [weak self] in
+            guard let self else { return }
+            self.requestedControls.torchLevel = level
+            self.requestedControls.torchOn = true
+            self.withDevice { try self.applyTorch(on: $0) }
+        }
+    }
+
+    func toggleTorch() {
+        sessionQueue.async { [weak self] in
+            guard let self else { return }
+            self.requestedControls.torchOn.toggle()
+            self.withDevice { try self.applyTorch(on: $0) }
+        }
+    }
+
+    private func applyTorch(on device: AVCaptureDevice) throws {
+        guard device.hasTorch, device.isTorchModeSupported(.on) else { return }
+        if requestedControls.torchOn {
+            // iOS may cap the torch lower while the phone is hot.
+            let ceiling = min(1, AVCaptureDevice.maxAvailableTorchLevel)
+            try device.setTorchModeOn(level: min(max(requestedControls.torchLevel, 0.05), ceiling))
+        } else if device.torchMode != .off {
+            device.torchMode = .off
+        }
+    }
+
+    // MARK: Remote shortcuts
+
+    /// Locks focus and exposure where they are, or hands both back to auto when either is already fixed.
+    func toggleFocusExposureLock() {
+        sessionQueue.async { [weak self] in
+            guard let self else { return }
+            let anyFixed = self.requestedControls.focusMode != .auto || self.requestedControls.exposureMode != .auto
+            self.requestedControls.focusMode = anyFixed ? .auto : .locked
+            self.requestedControls.exposureMode = anyFixed ? .auto : .locked
+            self.lockedLensPosition = nil
+            self.withDevice { device in
+                self.applyFocus(on: device)
+                try self.applyExposure(on: device)
+            }
+        }
+    }
+
+    func toggleWhiteBalanceLock() {
+        sessionQueue.async { [weak self] in
+            guard let self else { return }
+            self.requestedControls.whiteBalanceMode = self.requestedControls.whiteBalanceMode == .auto ? .locked : .auto
+            self.lockedWhiteBalanceGains = nil
+            self.withDevice { self.applyWhiteBalance(on: $0) }
+        }
+    }
+
+    func resetImageControls() {
+        sessionQueue.async { [weak self] in
+            guard let self else { return }
+            let torchOn = self.requestedControls.torchOn
+            let torchLevel = self.requestedControls.torchLevel
+            self.requestedControls = ImageControlsState()
+            self.requestedControls.torchOn = torchOn
+            self.requestedControls.torchLevel = torchLevel
+            self.lockedLensPosition = nil
+            self.lockedWhiteBalanceGains = nil
+            self.withDevice { device in
+                let center = CGPoint(x: 0.5, y: 0.5)
+                if device.isFocusPointOfInterestSupported {
+                    device.focusPointOfInterest = center
+                }
+                if device.isExposurePointOfInterestSupported {
+                    device.exposurePointOfInterest = center
+                }
+                self.applyFocus(on: device)
+                try self.applyExposure(on: device)
+                self.applyWhiteBalance(on: device)
+            }
+        }
+    }
+
+    // MARK: Plumbing
+
+    /// Runs `body` with the device locked for configuration, then publishes the new state. Session queue only.
+    private func withDevice(_ body: (AVCaptureDevice) throws -> Void) {
+        guard let device = captureDevice else { return }
+        do {
+            try device.lockForConfiguration()
+            defer { device.unlockForConfiguration() }
+            try body(device)
+        } catch {
+            publishWarning(error.localizedDescription)
+        }
+        publishImageControls()
+    }
+
+    /// Requested modes plus the camera's live readings, for the controls panel. Session queue only.
+    func publishImageControls() {
+        guard let device = captureDevice else { return }
+        let format = device.activeFormat
+        var state = requestedControls
+        state.supportsFocusLock = device.isFocusModeSupported(.locked)
+        state.lensPosition = device.lensPosition
+        state.supportsManualExposure = device.isExposureModeSupported(.custom)
+        state.exposureBias = device.exposureTargetBias
+        state.exposureBiasRange = max(device.minExposureTargetBias, -3)...min(device.maxExposureTargetBias, 3)
+        state.isoRange = format.minISO...max(format.minISO, format.maxISO)
+        state.iso = device.iso
+        state.shutterRange = format.minExposureDuration.seconds...longestShutterSeconds(on: device)
+        let shutter = device.exposureDuration.seconds
+        if shutter.isFinite, shutter > 0 {
+            state.shutterSeconds = shutter
+        }
+        state.supportsWhiteBalanceLock = device.isWhiteBalanceModeSupported(.locked)
+        if requestedControls.whiteBalanceMode != .manual {
+            state.temperature = device.temperatureAndTintValues(for: device.deviceWhiteBalanceGains).temperature
+        }
+        state.hasTorch = device.hasTorch && device.isTorchModeSupported(.on)
+        state.torchOn = device.torchMode == .on
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.imageControls != state else { return }
+            self.imageControls = state
+        }
+    }
+}
+
 extension CameraCaptureController: AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptureAudioDataOutputSampleBufferDelegate {
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
         if output == videoOutput {
@@ -911,24 +1442,26 @@ extension CameraCaptureController: AVCaptureVideoDataOutputSampleBufferDelegate,
 }
 
 private struct SelectedCameraFormat {
-    let width: Int
-    let height: Int
-    let fps: Int
+    let choice: CaptureFormatChoice
     let warning: String?
+
+    var width: Int { choice.resolution.width }
+    var height: Int { choice.resolution.height }
+    var fps: Int { choice.fps }
 }
 
 private enum CameraCaptureError: LocalizedError {
-    case noBackCamera
-    case no1080pFormat
+    case noCamera
+    case noFormat
     case cannotAddInput
     case cannotAddOutput
 
     var errorDescription: String? {
         switch self {
-        case .noBackCamera:
-            return "No back camera was found."
-        case .no1080pFormat:
-            return "This device does not expose a 1920x1080 capture format."
+        case .noCamera:
+            return "No camera was found at that position."
+        case .noFormat:
+            return "This camera has no 720p, 1080p or 4K format."
         case .cannotAddInput:
             return "The camera input could not be added."
         case .cannotAddOutput:

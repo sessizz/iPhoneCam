@@ -8,6 +8,9 @@ struct ContentView: View {
     @State private var isBLESettingsPresented = false
     @State private var isEditingCameraName = false
     @State private var editedCameraName = ""
+    @State private var isFormatSheetPresented = false
+    @State private var isCameraControlsPresented = false
+    @State private var focusIndicatorPoint: CGPoint?
 
     var body: some View {
         GeometryReader { proxy in
@@ -18,10 +21,33 @@ struct ContentView: View {
 
                 CameraPreview(renderer: model.previewRenderer)
                     .ignoresSafeArea()
+                    .overlay {
+                        GeometryReader { previewProxy in
+                            ZStack {
+                                Color.clear
+                                    .contentShape(Rectangle())
+                                    .gesture(
+                                        SpatialTapGesture().onEnded { value in
+                                            handlePreviewTap(at: value.location, in: previewProxy.size)
+                                        }
+                                    )
+                                if let focusIndicatorPoint {
+                                    FocusIndicator(point: focusIndicatorPoint)
+                                        .transition(.opacity)
+                                }
+                            }
+                        }
+                        .ignoresSafeArea()
+                    }
 
                 controlOverlay(size: proxy.size, compact: compact)
                     .ignoresSafeArea()
+
+                TallyBorder(program: model.tallyProgram, preview: model.tallyPreview)
             }
+        }
+        .sheet(isPresented: $isFormatSheetPresented) {
+            FormatSheet(capture: model.capture, model: model)
         }
         .task {
             model.start()
@@ -31,6 +57,22 @@ struct ContentView: View {
         }
         .onDisappear {
             model.stop()
+        }
+    }
+
+    private func handlePreviewTap(at location: CGPoint, in size: CGSize) {
+        guard let point = model.picturePoint(for: location, in: size) else {
+            return
+        }
+        model.capture.focusAndExpose(at: point)
+        withAnimation(.easeOut(duration: 0.12)) {
+            focusIndicatorPoint = location
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
+            guard focusIndicatorPoint == location else { return }
+            withAnimation(.easeIn(duration: 0.25)) {
+                focusIndicatorPoint = nil
+            }
         }
     }
 
@@ -54,6 +96,31 @@ struct ContentView: View {
             bottomZoomBar
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
                 .padding(.bottom, compact ? 12 : 20)
+
+            CameraToolbar(
+                capture: model.capture,
+                compact: compact,
+                tallyProgram: model.tallyProgram,
+                tallyPreview: model.tallyPreview,
+                onFormat: { isFormatSheetPresented = true },
+                onControls: {
+                    withAnimation(.easeInOut(duration: 0.18)) {
+                        isCameraControlsPresented = true
+                    }
+                },
+                onToggleCamera: model.toggleCameraPosition
+            )
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .trailing)
+            .padding(.trailing, compact ? 10 : 16)
+
+            if isCameraControlsPresented {
+                CameraControlsPanel(capture: model.capture, compact: compact) {
+                    withAnimation(.easeInOut(duration: 0.18)) {
+                        isCameraControlsPresented = false
+                    }
+                }
+                .transition(.opacity.combined(with: .scale(scale: 0.96)))
+            }
 
             if isBLESettingsPresented {
                 bleSettingsModal(compact: compact)
@@ -203,15 +270,23 @@ struct ContentView: View {
                         }
                         Divider()
                             .overlay(.white.opacity(0.18))
-                        Text("Video Codec: \(model.activeCodec.rawValue)")
-                        codecPicker
-                        Text("Stream Quality: \(model.streamQuality.label)")
-                        qualityPicker
-                        Text(model.streamQuality == .maximum
-                             ? "Probes above the target while the link is clean (most headroom over USB)."
-                             : "Holds the codec target and only backs off when the link struggles.")
-                            .font(.caption2)
-                            .foregroundStyle(.white.opacity(0.65))
+                        HStack {
+                            Text("Format: \(model.capture.formatChoice.resolution.label) \(model.capture.formatChoice.fps) fps, \(model.activeCodec.rawValue), \(model.streamQuality.label)")
+                                .lineLimit(1)
+                                .minimumScaleFactor(0.7)
+                            Spacer()
+                            Button {
+                                isFormatSheetPresented = true
+                            } label: {
+                                Text("Change")
+                                    .font(.caption.weight(.semibold))
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 5)
+                                    .background(Color.white.opacity(0.2), in: Capsule())
+                                    .foregroundStyle(.white)
+                            }
+                            .buttonStyle(.plain)
+                        }
                         Divider()
                             .overlay(.white.opacity(0.18))
                         HStack(alignment: .center) {
@@ -299,31 +374,6 @@ struct ContentView: View {
         .frame(maxWidth: isInfoExpanded ? expandedWidth : collapsedWidth)
         .background(.black.opacity(0.62), in: RoundedRectangle(cornerRadius: 8))
         .foregroundStyle(.white)
-    }
-
-    private var codecPicker: some View {
-        Picker("Codec", selection: Binding(
-            get: { model.activeCodec },
-            set: { model.setCodec($0) }
-        )) {
-            Text("HEVC (H.265)").tag(VideoCodecType.hevc)
-            Text("H.264").tag(VideoCodecType.h264)
-        }
-        .pickerStyle(.segmented)
-        .labelsHidden()
-    }
-
-    private var qualityPicker: some View {
-        Picker("Stream Quality", selection: Binding(
-            get: { model.streamQuality },
-            set: { model.setStreamQuality($0) }
-        )) {
-            ForEach(StreamQuality.allCases) { quality in
-                Text(quality.label).tag(quality)
-            }
-        }
-        .pickerStyle(.segmented)
-        .labelsHidden()
     }
 
     private var audioProfilePicker: some View {
@@ -657,6 +707,9 @@ final class CameraViewModel: ObservableObject {
         static let audioProfile = "camera.audioProfile"
         static let isAudioMuted = "camera.isAudioMuted"
         static let streamQuality = "stream.quality"
+        static let resolution = "stream.resolution"
+        static let frameRate = "stream.frameRate"
+        static let cameraPosition = "camera.position"
     }
 
     @Published var networkStatus = "Starting listener..."
@@ -677,6 +730,8 @@ final class CameraViewModel: ObservableObject {
     @Published var streamQuality: StreamQuality = .balanced
     @Published var connectAddresses: [String] = []
     @Published var receiverCount = 0
+    @Published var tallyProgram = false
+    @Published var tallyPreview = false
 
     /// What to type into OBS or the Mac app: the phone's IP (Bonjour name lookup also works on the same network).
     var connectHint: String {
@@ -780,6 +835,12 @@ final class CameraViewModel: ObservableObject {
         sender.onReceiverCountChanged = { [weak self] count in
             Task { @MainActor in
                 self?.receiverCount = count
+            }
+        }
+        sender.onTallyChanged = { [weak self] program, preview in
+            Task { @MainActor in
+                self?.tallyProgram = program
+                self?.tallyPreview = preview
             }
         }
         let sender = sender
@@ -1024,6 +1085,65 @@ final class CameraViewModel: ObservableObject {
         }
         capture.setQuality(streamQuality)
         sender.setQuality(streamQuality)
+
+        var choice = CaptureFormatChoice.standard
+        if let raw = defaults.string(forKey: SettingsKey.resolution), let resolution = StreamResolution(rawValue: raw) {
+            choice.resolution = resolution
+        }
+        if defaults.object(forKey: SettingsKey.frameRate) != nil {
+            choice.fps = defaults.integer(forKey: SettingsKey.frameRate)
+        }
+        capture.setFormat(choice)
+        if let raw = defaults.string(forKey: SettingsKey.cameraPosition), let position = CameraPosition(rawValue: raw) {
+            capture.setCameraPosition(position)
+        }
+    }
+
+    /// Stores the request rather than what the camera resolved it to, so a camera that cannot do 4K now still
+    /// gets 4K back after switching to one that can.
+    func setFormat(_ choice: CaptureFormatChoice) {
+        let defaults = UserDefaults.standard
+        defaults.set(choice.resolution.rawValue, forKey: SettingsKey.resolution)
+        defaults.set(choice.fps, forKey: SettingsKey.frameRate)
+        capture.setFormat(choice)
+    }
+
+    /// Keeps the frame rate when the new resolution offers it, else the closest one below.
+    func setResolution(_ resolution: StreamResolution) {
+        let rates = capture.supportedFrameRates[resolution] ?? []
+        let current = capture.formatChoice.fps
+        let fps = rates.contains(current) ? current : (rates.last(where: { $0 <= current }) ?? rates.first ?? current)
+        setFormat(CaptureFormatChoice(resolution: resolution, fps: fps))
+    }
+
+    func setFrameRate(_ fps: Int) {
+        setFormat(CaptureFormatChoice(resolution: capture.formatChoice.resolution, fps: fps))
+    }
+
+    func setCameraPosition(_ position: CameraPosition) {
+        UserDefaults.standard.set(position.rawValue, forKey: SettingsKey.cameraPosition)
+        capture.setCameraPosition(position)
+    }
+
+    func toggleCameraPosition() {
+        setCameraPosition(capture.cameraPosition == .back ? .front : .back)
+    }
+
+    /// Maps a tap on the full-screen preview to a point in the picture, (0, 0) top-left; nil outside the picture.
+    func picturePoint(for location: CGPoint, in size: CGSize) -> CGPoint? {
+        let resolution = capture.formatChoice.resolution
+        let aspect = CGFloat(resolution.width) / CGFloat(resolution.height)
+        var pictureSize = CGSize(width: size.width, height: size.width / aspect)
+        if pictureSize.height > size.height {
+            pictureSize = CGSize(width: size.height * aspect, height: size.height)
+        }
+        let origin = CGPoint(x: (size.width - pictureSize.width) / 2, y: (size.height - pictureSize.height) / 2)
+        let x = (location.x - origin.x) / pictureSize.width
+        let y = (location.y - origin.y) / pictureSize.height
+        guard (0...1).contains(x), (0...1).contains(y) else {
+            return nil
+        }
+        return CGPoint(x: x, y: y)
     }
 
     func setStreamQuality(_ quality: StreamQuality) {
@@ -1156,8 +1276,29 @@ final class CameraViewModel: ObservableObject {
             capture.rampZoom(to: 1, duration: presetRampDuration)
         case .requestKeyFrame:
             capture.requestKeyFrame()
-        case .identify:
-            // The sender consumes identify itself.
+        case .toggleTorch:
+            remoteControlStatus = "OBS control: flashlight"
+            capture.toggleTorch()
+        case .switchCamera:
+            remoteControlStatus = "OBS control: switch camera"
+            toggleCameraPosition()
+        case .toggleFocusExposureLock:
+            remoteControlStatus = "OBS control: focus/exposure lock"
+            capture.toggleFocusExposureLock()
+        case .exposureUp:
+            remoteControlStatus = "OBS control: exposure +"
+            capture.adjustExposure(steps: 1)
+        case .exposureDown:
+            remoteControlStatus = "OBS control: exposure -"
+            capture.adjustExposure(steps: -1)
+        case .toggleWhiteBalanceLock:
+            remoteControlStatus = "OBS control: white balance lock"
+            capture.toggleWhiteBalanceLock()
+        case .resetImageControls:
+            remoteControlStatus = "OBS control: image to auto"
+            capture.resetImageControls()
+        case .identify, .tally:
+            // The sender consumes these itself.
             break
         }
     }
@@ -1295,5 +1436,449 @@ private struct ZoomPresetButtonStyle: ButtonStyle {
             .font(.footnote.monospacedDigit().weight(.semibold))
             .foregroundStyle(.white)
             .background(.white.opacity(configuration.isPressed ? 0.30 : 0.16), in: RoundedRectangle(cornerRadius: 8))
+    }
+}
+
+// MARK: - Camera toolbar, format sheet, image controls, tally
+
+/// Right-edge buttons: format, image controls, torch, front/back.
+private struct CameraToolbar: View {
+    @ObservedObject var capture: CameraCaptureController
+    let compact: Bool
+    let tallyProgram: Bool
+    let tallyPreview: Bool
+    let onFormat: () -> Void
+    let onControls: () -> Void
+    let onToggleCamera: () -> Void
+
+    private var buttonHeight: CGFloat { compact ? 40 : 48 }
+
+    var body: some View {
+        VStack(spacing: compact ? 6 : 10) {
+            if tallyProgram || tallyPreview {
+                Text(tallyProgram ? "ON AIR" : "PREVIEW")
+                    .font(.system(size: 11, weight: .heavy, design: .rounded))
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(tallyProgram ? Color.red : Color.green, in: Capsule())
+                    .foregroundStyle(.white)
+            }
+
+            Button(action: onFormat) {
+                VStack(spacing: 1) {
+                    Text(capture.formatChoice.resolution.label)
+                        .font(.caption.weight(.bold))
+                    Text("\(capture.formatChoice.fps) fps")
+                        .font(.caption2.monospacedDigit().weight(.semibold))
+                        .foregroundStyle(.white.opacity(0.75))
+                }
+                .frame(width: 56, height: buttonHeight)
+            }
+            .buttonStyle(GlassIconButtonStyle())
+            .accessibilityLabel("Format")
+
+            Button(action: onControls) {
+                Image(systemName: "camera.aperture")
+                    .font(.title3.weight(.semibold))
+                    .frame(width: 56, height: buttonHeight)
+            }
+            .buttonStyle(GlassIconButtonStyle())
+            .accessibilityLabel("Camera Controls")
+
+            Button {
+                capture.toggleTorch()
+            } label: {
+                Image(systemName: capture.imageControls.torchOn ? "flashlight.on.fill" : "flashlight.off.fill")
+                    .font(.title3.weight(.semibold))
+                    .foregroundStyle(capture.imageControls.torchOn ? .yellow : .white)
+                    .frame(width: 56, height: buttonHeight)
+            }
+            .buttonStyle(GlassIconButtonStyle())
+            .disabled(!capture.imageControls.hasTorch)
+            .opacity(capture.imageControls.hasTorch ? 1 : 0.35)
+            .accessibilityLabel(capture.imageControls.torchOn ? "Turn Flashlight Off" : "Turn Flashlight On")
+
+            Button(action: onToggleCamera) {
+                Image(systemName: "arrow.triangle.2.circlepath.camera")
+                    .font(.title3.weight(.semibold))
+                    .frame(width: 56, height: buttonHeight)
+            }
+            .buttonStyle(GlassIconButtonStyle())
+            .accessibilityLabel(capture.cameraPosition == .back ? "Switch to Front Camera" : "Switch to Back Camera")
+        }
+        .padding(8)
+        .background(.black.opacity(0.46), in: RoundedRectangle(cornerRadius: 8))
+    }
+}
+
+/// The program/preview frame around the whole screen, so the camera operator sees it from across the room.
+private struct TallyBorder: View {
+    let program: Bool
+    let preview: Bool
+
+    var body: some View {
+        if program || preview {
+            Rectangle()
+                .strokeBorder(program ? Color.red : Color.green, lineWidth: program ? 8 : 5)
+                .ignoresSafeArea()
+                .allowsHitTesting(false)
+        }
+    }
+}
+
+private struct FormatSheet: View {
+    @ObservedObject var capture: CameraCaptureController
+    @ObservedObject var model: CameraViewModel
+    @Environment(\.dismiss) private var dismiss
+
+    private var resolutions: [StreamResolution] {
+        StreamResolution.allCases.filter { !(capture.supportedFrameRates[$0] ?? []).isEmpty }
+    }
+
+    private var frameRates: [Int] {
+        capture.supportedFrameRates[capture.formatChoice.resolution] ?? [capture.formatChoice.fps]
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section {
+                    Picker("Camera", selection: Binding(
+                        get: { capture.cameraPosition },
+                        set: { model.setCameraPosition($0) }
+                    )) {
+                        ForEach(CameraPosition.allCases) { position in
+                            Text(position.label).tag(position)
+                        }
+                    }
+                    Picker("Resolution", selection: Binding(
+                        get: { capture.formatChoice.resolution },
+                        set: { model.setResolution($0) }
+                    )) {
+                        ForEach(resolutions) { resolution in
+                            Text(resolution.label).tag(resolution)
+                        }
+                    }
+                    Picker("Frame rate", selection: Binding(
+                        get: { capture.formatChoice.fps },
+                        set: { model.setFrameRate($0) }
+                    )) {
+                        ForEach(frameRates, id: \.self) { fps in
+                            Text("\(fps) fps").tag(fps)
+                        }
+                    }
+                } footer: {
+                    Text("Only the formats this camera supports are listed.")
+                }
+                .pickerStyle(.menu)
+
+                Section("Codec") {
+                    checkRow("HEVC", isSelected: model.activeCodec == .hevc) {
+                        model.setCodec(.hevc)
+                    }
+                    checkRow("H.264", isSelected: model.activeCodec == .h264) {
+                        model.setCodec(.h264)
+                    }
+                }
+
+                Section {
+                    checkRow("Balanced", isSelected: model.streamQuality == .balanced) {
+                        model.setStreamQuality(.balanced)
+                    }
+                    checkRow("Maximum", badge: "Beta", isSelected: model.streamQuality == .maximum) {
+                        model.setStreamQuality(.maximum)
+                    }
+                } header: {
+                    Text("Quality")
+                } footer: {
+                    Text(model.streamQuality == .maximum
+                         ? "Starts above the codec target and climbs while the link stays clean, furthest over USB."
+                         : "Holds the codec target and only backs off when the link struggles.")
+                }
+            }
+            .navigationTitle("Format")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Done") {
+                        dismiss()
+                    }
+                }
+            }
+        }
+        .preferredColorScheme(.dark)
+    }
+
+    private func checkRow(_ title: String, badge: String? = nil, isSelected: Bool, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            HStack {
+                Text(title)
+                    .foregroundStyle(.primary)
+                if let badge {
+                    Text(badge)
+                        .font(.caption.weight(.semibold))
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 2)
+                        .background(Color.blue.opacity(0.22), in: Capsule())
+                        .foregroundStyle(.blue)
+                }
+                Spacer()
+                if isSelected {
+                    Image(systemName: "checkmark")
+                        .font(.body.weight(.semibold))
+                        .foregroundStyle(.blue)
+                }
+            }
+            .contentShape(Rectangle())
+        }
+        // Plain, so the row reads as a setting rather than a tinted link.
+        .buttonStyle(.plain)
+    }
+}
+
+private struct CameraControlsPanel: View {
+    @ObservedObject var capture: CameraCaptureController
+    let compact: Bool
+    let onClose: () -> Void
+
+    private var controls: ImageControlsState { capture.imageControls }
+
+    var body: some View {
+        ZStack {
+            Color.black.opacity(0.35)
+                .ignoresSafeArea()
+                .onTapGesture(perform: onClose)
+
+            VStack(alignment: .leading, spacing: 10) {
+                HStack {
+                    Text("Camera")
+                        .font(.headline.weight(.semibold))
+                    Spacer()
+                    Button {
+                        capture.resetImageControls()
+                    } label: {
+                        Label("Auto", systemImage: "arrow.counterclockwise")
+                            .font(.subheadline.weight(.semibold))
+                            .frame(height: 34)
+                            .padding(.horizontal, 10)
+                    }
+                    .buttonStyle(GlassIconButtonStyle())
+                    .accessibilityLabel("Reset Focus, Exposure and White Balance to Auto")
+                    Button(action: onClose) {
+                        Image(systemName: "xmark")
+                            .font(.headline.weight(.semibold))
+                            .frame(width: 38, height: 34)
+                    }
+                    .buttonStyle(GlassIconButtonStyle())
+                    .accessibilityLabel("Close Camera Controls")
+                }
+
+                ScrollView(.vertical) {
+                    VStack(alignment: .leading, spacing: 14) {
+                        focusSection
+                        Divider().overlay(.white.opacity(0.18))
+                        exposureSection
+                        Divider().overlay(.white.opacity(0.18))
+                        whiteBalanceSection
+                        if controls.hasTorch {
+                            Divider().overlay(.white.opacity(0.18))
+                            torchSection
+                        }
+                        Text("Tap the picture to focus and expose there.")
+                            .font(.caption)
+                            .foregroundStyle(.white.opacity(0.6))
+                    }
+                    .padding(.bottom, 4)
+                }
+            }
+            .padding(compact ? 14 : 18)
+            .frame(maxWidth: compact ? 560 : 620, alignment: .leading)
+            .frame(maxHeight: compact ? 340 : 520)
+            .background(.black.opacity(0.84), in: RoundedRectangle(cornerRadius: 8))
+            .overlay(RoundedRectangle(cornerRadius: 8).stroke(.white.opacity(0.14), lineWidth: 1))
+            .foregroundStyle(.white)
+            .padding(.horizontal, 24)
+        }
+    }
+
+    private var focusSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            sectionHeader("Focus", systemImage: "scope") {
+                Picker("Focus", selection: Binding(
+                    get: { controls.focusMode },
+                    set: { capture.setFocusMode($0) }
+                )) {
+                    ForEach(FocusControlMode.allCases) { Text($0.label).tag($0) }
+                }
+                .pickerStyle(.segmented)
+                .disabled(!controls.supportsFocusLock)
+            }
+            sliderRow("Near", trailing: "Far") {
+                LiveSlider(value: Double(controls.lensPosition), range: 0...1) { capture.setLensPosition(Float($0)) }
+            }
+            .disabled(!controls.supportsFocusLock)
+        }
+    }
+
+    private var exposureSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            sectionHeader("Exposure", systemImage: "sun.max") {
+                Picker("Exposure", selection: Binding(
+                    get: { controls.exposureMode },
+                    set: { capture.setExposureMode($0) }
+                )) {
+                    ForEach(ExposureControlMode.allCases) { mode in
+                        Text(mode.label).tag(mode)
+                    }
+                }
+                .pickerStyle(.segmented)
+            }
+            if controls.exposureMode == .manual && controls.supportsManualExposure {
+                sliderRow("ISO", trailing: String(format: "%.0f", controls.iso)) {
+                    LiveSlider(
+                        value: Double(controls.iso),
+                        range: Double(controls.isoRange.lowerBound)...Double(controls.isoRange.upperBound)
+                    ) { capture.setISO(Float($0)) }
+                }
+                sliderRow("Shutter", trailing: Self.shutterLabel(controls.shutterSeconds)) {
+                    // Logarithmic: equal travel is an equal number of stops.
+                    LiveSlider(value: shutterPosition(controls.shutterSeconds), range: 0...1) {
+                        capture.setShutter(seconds: shutterSeconds(at: $0))
+                    }
+                }
+            } else {
+                sliderRow("EV", trailing: String(format: "%+.1f", controls.exposureBias)) {
+                    LiveSlider(
+                        value: Double(controls.exposureBias),
+                        range: Double(controls.exposureBiasRange.lowerBound)...Double(controls.exposureBiasRange.upperBound)
+                    ) { capture.setExposureBias(Float($0)) }
+                }
+                Text("ISO \(Int(controls.iso)) · \(Self.shutterLabel(controls.shutterSeconds))")
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.white.opacity(0.6))
+            }
+        }
+    }
+
+    private var whiteBalanceSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            sectionHeader("White balance", systemImage: "thermometer.medium") {
+                Picker("White balance", selection: Binding(
+                    get: { controls.whiteBalanceMode },
+                    set: { capture.setWhiteBalanceMode($0) }
+                )) {
+                    ForEach(WhiteBalanceControlMode.allCases) { mode in
+                        Text(mode.label).tag(mode)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .disabled(!controls.supportsWhiteBalanceLock)
+            }
+            sliderRow("Kelvin", trailing: "\(Int(controls.temperature)) K") {
+                LiveSlider(value: Double(controls.temperature), range: 2500...9000) { capture.setTemperature(Float($0)) }
+            }
+            .disabled(!controls.supportsWhiteBalanceLock)
+            Button {
+                capture.calibrateWhiteBalance()
+            } label: {
+                Label("Calibrate on white paper or a gray card", systemImage: "eyedropper")
+                    .font(.subheadline.weight(.semibold))
+                    .frame(maxWidth: .infinity, minHeight: 34)
+            }
+            .buttonStyle(GlassIconButtonStyle())
+            .disabled(!controls.supportsWhiteBalanceLock)
+        }
+    }
+
+    private var torchSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            sectionHeader("Flashlight", systemImage: "flashlight.on.fill") {
+                Toggle("Flashlight", isOn: Binding(
+                    get: { controls.torchOn },
+                    set: { capture.setTorch(on: $0) }
+                ))
+                .labelsHidden()
+            }
+            sliderRow("Level", trailing: "\(Int(controls.torchLevel * 100))%") {
+                LiveSlider(value: Double(controls.torchLevel), range: 0.05...1) { capture.setTorchLevel(Float($0)) }
+            }
+        }
+    }
+
+    private func sectionHeader<Control: View>(_ title: String, systemImage: String, @ViewBuilder control: () -> Control) -> some View {
+        HStack(spacing: 10) {
+            Label(title, systemImage: systemImage)
+                .font(.subheadline.weight(.semibold))
+                .frame(width: 140, alignment: .leading)
+            control()
+        }
+    }
+
+    private func sliderRow<Content: View>(_ label: String, trailing: String, @ViewBuilder slider: () -> Content) -> some View {
+        HStack(spacing: 8) {
+            Text(label)
+                .font(.caption.weight(.semibold))
+                .frame(width: 52, alignment: .leading)
+            slider()
+            Text(trailing)
+                .font(.caption.monospacedDigit().weight(.semibold))
+                .frame(width: 62, alignment: .trailing)
+        }
+    }
+
+    private func shutterPosition(_ seconds: Double) -> Double {
+        let range = controls.shutterRange
+        guard range.upperBound > range.lowerBound, seconds > 0 else { return 0 }
+        return log(seconds / range.lowerBound) / log(range.upperBound / range.lowerBound)
+    }
+
+    private func shutterSeconds(at position: Double) -> Double {
+        let range = controls.shutterRange
+        return range.lowerBound * pow(range.upperBound / range.lowerBound, position)
+    }
+
+    static func shutterLabel(_ seconds: Double) -> String {
+        guard seconds > 0 else { return "-" }
+        return seconds >= 1 ? String(format: "%.1fs", seconds) : "1/\(Int((1 / seconds).rounded()))"
+    }
+}
+
+/// A slider that follows a value published asynchronously by the camera, without snapping back while dragged.
+private struct LiveSlider: View {
+    let value: Double
+    let range: ClosedRange<Double>
+    let onChange: (Double) -> Void
+
+    @State private var draggedValue: Double?
+
+    var body: some View {
+        Slider(
+            value: Binding(
+                get: { min(max(draggedValue ?? value, range.lowerBound), range.upperBound) },
+                set: { newValue in
+                    draggedValue = newValue
+                    onChange(newValue)
+                }
+            ),
+            in: range,
+            onEditingChanged: { editing in
+                if !editing {
+                    draggedValue = nil
+                }
+            }
+        )
+    }
+}
+
+/// The square that briefly marks where a tap focused.
+private struct FocusIndicator: View {
+    let point: CGPoint
+
+    var body: some View {
+        RoundedRectangle(cornerRadius: 4)
+            .stroke(Color.yellow, lineWidth: 2)
+            .frame(width: 72, height: 72)
+            .position(point)
+            .allowsHitTesting(false)
     }
 }

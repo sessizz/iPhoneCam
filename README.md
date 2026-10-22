@@ -29,6 +29,16 @@ Every connection is TCP with `TCP_NODELAY`, so nothing is lost on the way; what 
 - The phone pings every 2 s and answers clock-sync requests, so receivers detect dead links in 6 s and OBS shows the
   capture-to-decode latency.
 
+## On the iPhone
+
+- **Format** (the `1080p / 60 fps` button on the right edge): camera (back/front), resolution (720p, 1080p, 4K)
+  and frame rate (24 to 240 fps, as the camera allows), codec (HEVC/H.264) and quality (Balanced/Maximum).
+- **Camera controls** (aperture button): focus (auto, lock, manual distance), exposure (auto, lock, EV bias,
+  manual ISO and shutter), white balance (auto, lock, Kelvin, calibrate on white paper or a gray card) and the
+  flashlight with its level. Tap the picture to focus and expose there.
+- Flashlight and front/back camera also have their own buttons; OBS can drive all of these with hotkeys.
+- Tally: a red frame and `ON AIR` while the OBS source is on air, green and `PREVIEW` while it only shows elsewhere.
+
 ## First Manual Test
 
 1. Run `iPhoneCam` on a physical iPhone and accept camera, microphone and local network permissions.

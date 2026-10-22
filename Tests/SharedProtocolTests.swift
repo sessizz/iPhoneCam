@@ -411,4 +411,39 @@ final class SharedProtocolTests: XCTestCase {
         XCTAssertEqual(ClockOffsetEstimator.echoedClock(in: Data([0, 0, 0, 0, 0x3B, 0x9A, 0xCA, 0x00])), 1_000_000_000)
         XCTAssertNil(ClockOffsetEstimator.echoedClock(in: Data([1, 2, 3])))
     }
+
+    func testTallyAndImageControlsDecodeOBSPayloads() throws {
+        let tally = try JSONDecoder().decode(
+            CameraControlPayload.self,
+            from: Data(#"{"action":"tally","program":true,"preview":false}"#.utf8)
+        )
+        XCTAssertEqual(tally.action, .tally)
+        XCTAssertEqual(tally.program, true)
+        XCTAssertEqual(tally.preview, false)
+
+        let names: [String: CameraControlAction] = [
+            "toggleTorch": .toggleTorch,
+            "switchCamera": .switchCamera,
+            "toggleFocusExposureLock": .toggleFocusExposureLock,
+            "exposureUp": .exposureUp,
+            "exposureDown": .exposureDown,
+            "toggleWhiteBalanceLock": .toggleWhiteBalanceLock,
+            "resetImageControls": .resetImageControls,
+        ]
+        for (name, action) in names {
+            let payload = try JSONDecoder().decode(CameraControlPayload.self, from: Data(#"{"action":"\#(name)"}"#.utf8))
+            XCTAssertEqual(payload.action, action)
+        }
+    }
+
+    func testBaseBitrateScalesWithFormat() {
+        let hevc = CameraProtocol.codecHEVCHVCC
+        let h264 = CameraProtocol.codecH264AVCC
+        XCTAssertEqual(CameraProtocol.baseBitrate(codec: hevc, width: 1920, height: 1080, fps: 60), 8_000_000)
+        XCTAssertEqual(CameraProtocol.baseBitrate(codec: h264, width: 1920, height: 1080, fps: 60), 12_000_000)
+        XCTAssertEqual(CameraProtocol.baseBitrate(codec: hevc, width: 1280, height: 720, fps: 30), 4_000_000)
+        XCTAssertEqual(CameraProtocol.baseBitrate(codec: h264, width: 3840, height: 2160, fps: 60), 40_000_000)
+        XCTAssertEqual(CameraProtocol.baseBitrate(codec: hevc, width: 1920, height: 1080, fps: 120), 12_000_000)
+        XCTAssertEqual(CameraProtocol.baseBitrate(codec: hevc, width: 1920, height: 1080, fps: 240), 16_000_000)
+    }
 }

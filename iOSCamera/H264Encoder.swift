@@ -25,15 +25,6 @@ enum VideoCodecType: String, CaseIterable, Identifiable, Sendable {
             return CameraProtocol.codecH264AVCC
         }
     }
-
-    var defaultBitrate: Int {
-        switch self {
-        case .hevc:
-            return CameraProtocol.targetBitrateHEVC
-        case .h264:
-            return CameraProtocol.targetBitrateH264
-        }
-    }
 }
 
 struct H264Format: Equatable {
@@ -110,7 +101,7 @@ final class H264Encoder {
         self.width = width
         self.height = height
         self.fps = fps
-        self.bitrate = bitrate ?? codec.defaultBitrate
+        self.bitrate = bitrate ?? CameraProtocol.baseBitrate(codec: codec.protocolCodec, width: width, height: height, fps: fps)
         appliedBitrate = self.bitrate
         createSession()
     }
@@ -211,8 +202,11 @@ final class H264Encoder {
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxKeyFrameInterval, value: (fps * 3) as CFTypeRef)
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, value: 3.0 as CFTypeRef)
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_ExpectedFrameRate, value: fps as CFTypeRef)
-        // Maximum spends the encoder's spare time on quality; at 1080p that costs a few milliseconds per frame.
-        let prioritizeSpeed = quality == .balanced ? kCFBooleanTrue : kCFBooleanFalse
+        // Maximum spends the encoder's spare time on quality, which at 1080p costs a few milliseconds per frame.
+        // Above 1080p (or past 1080p120's pixel rate) quality mode slows every frame by tens of milliseconds for no
+        // visible gain, so those stay in speed mode.
+        let qualityAffordable = width * height <= 1920 * 1080 && width * height * fps <= 1920 * 1080 * 120
+        let prioritizeSpeed = quality == .maximum && qualityAffordable ? kCFBooleanFalse : kCFBooleanTrue
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality, value: prioritizeSpeed)
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxFrameDelayCount, value: 1 as CFTypeRef)
         applyBitrate(bitrate, to: session)

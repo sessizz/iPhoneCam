@@ -32,6 +32,11 @@ The plugin bundle is produced as `build/obs-plugin/iphonecam-obs.plugin`.
 - Bind the `iPhoneCam: Zoom In Slow/Medium/Fast`, `iPhoneCam: Zoom Out Slow/Medium/Fast`, and
   `iPhoneCam: Reset Zoom` actions in OBS Settings > Hotkeys. Press-and-hold zoom keys ramp the iPhone lens;
   releasing the key stops the ramp.
+- Image hotkeys in the same place: `Toggle Flashlight`, `Switch Front/Back Camera`, `Lock/Unlock Focus and
+  Exposure`, `Exposure +` / `Exposure -` (a third of a stop; ISO in manual exposure), `Lock/Unlock White Balance`,
+  and `Focus, Exposure and White Balance to Auto`.
+- Tally: the iPhone frames its screen red (`ON AIR`) while the source is in the program output and green
+  (`PREVIEW`) while it is only showing elsewhere, such as the studio-mode preview or a projector.
 - FPS and bitrate are reported from the iPhone stream; OBS does not control the encoder yet.
 - After a lost frame or a decode error the source holds the last good frame and asks the iPhone for a keyframe
   (at most every 250 ms) instead of decoding a broken reference chain.

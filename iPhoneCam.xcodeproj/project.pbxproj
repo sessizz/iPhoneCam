@@ -38,6 +38,7 @@
 		300000000000000000000033 /* NetworkInfo.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000032 /* NetworkInfo.swift */; };
 		300000000000000000000034 /* ClockOffsetEstimator.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000033 /* ClockOffsetEstimator.swift */; };
 		300000000000000000000035 /* ClockOffsetEstimator.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000033 /* ClockOffsetEstimator.swift */; };
+		300000000000000000000036 /* CameraSettings.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000034 /* CameraSettings.swift */; };
 		300000000000000000000029 /* DeviceIdentity.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000029 /* DeviceIdentity.swift */; };
 		300000000000000000000030 /* AudioEncoder.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000030 /* AudioEncoder.swift */; };
 /* End PBXBuildFile section */
@@ -74,6 +75,7 @@
 		200000000000000000000031 /* AdaptiveBitrate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AdaptiveBitrate.swift; sourceTree = "<group>"; };
 		200000000000000000000032 /* NetworkInfo.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NetworkInfo.swift; sourceTree = "<group>"; };
 		200000000000000000000033 /* ClockOffsetEstimator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ClockOffsetEstimator.swift; sourceTree = "<group>"; };
+		200000000000000000000034 /* CameraSettings.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CameraSettings.swift; sourceTree = "<group>"; };
 		200000000000000000000029 /* DeviceIdentity.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DeviceIdentity.swift; sourceTree = "<group>"; };
 		200000000000000000000030 /* AudioEncoder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AudioEncoder.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
@@ -143,6 +145,7 @@
 				200000000000000000000004 /* ContentView.swift */,
 				200000000000000000000005 /* CameraPreview.swift */,
 				200000000000000000000006 /* CameraCaptureController.swift */,
+				200000000000000000000034 /* CameraSettings.swift */,
 				200000000000000000000007 /* H264Encoder.swift */,
 				200000000000000000000030 /* AudioEncoder.swift */,
 				200000000000000000000009 /* NetworkVideoSender.swift */,
@@ -340,6 +343,7 @@
 				300000000000000000000004 /* ContentView.swift in Sources */,
 				300000000000000000000005 /* CameraPreview.swift in Sources */,
 				300000000000000000000006 /* CameraCaptureController.swift in Sources */,
+				300000000000000000000036 /* CameraSettings.swift in Sources */,
 				300000000000000000000007 /* H264Encoder.swift in Sources */,
 				300000000000000000000030 /* AudioEncoder.swift in Sources */,
 				300000000000000000000009 /* NetworkVideoSender.swift in Sources */,

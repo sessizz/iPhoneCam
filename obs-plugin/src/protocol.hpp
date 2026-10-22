@@ -81,6 +81,16 @@ enum class ControlAction {
     RequestKeyFrame,
     // Sent right after connecting: how this receiver reached the iPhone and what it is called.
     Identify,
+    ToggleTorch,
+    SwitchCamera,
+    // Locks focus and exposure where they are, or hands both back to auto when either is fixed.
+    ToggleFocusExposureLock,
+    ExposureUp,
+    ExposureDown,
+    ToggleWhiteBalanceLock,
+    ResetImageControls,
+    // Whether this source is on air (program) or only showing elsewhere (preview); sent on change and on connect.
+    Tally,
 };
 
 enum class ControlSpeed {
@@ -95,6 +105,9 @@ struct ControlCommand {
     // Identify only.
     std::string transport;
     std::string clientName;
+    // Tally only.
+    bool program = false;
+    bool preview = false;
 };
 
 std::optional<CameraPacket> parsePacket(const uint8_t *data, size_t size);

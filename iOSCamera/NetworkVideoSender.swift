@@ -14,6 +14,8 @@ final class NetworkVideoSender: @unchecked Sendable {
     var onBitrateChanged: ((Int) -> Void)?
     var onAddressesChanged: (([String]) -> Void)?
     var onReceiverCountChanged: ((Int) -> Void)?
+    /// Whether any receiver has this camera on air, or only showing somewhere else (OBS preview, a projector).
+    var onTallyChanged: ((_ program: Bool, _ preview: Bool) -> Void)?
 
     private final class Client: @unchecked Sendable {
         let connection: NWConnection
@@ -32,6 +34,8 @@ final class NetworkVideoSender: @unchecked Sendable {
         /// When a frame send last completed; a full queue with no progress means the receiver stopped reading.
         var lastProgressNanos = DispatchTime.now().uptimeNanoseconds
         var completedSinceTick = 0
+        var tallyProgram = false
+        var tallyPreview = false
 
         init(connection: NWConnection) {
             self.connection = connection
@@ -84,6 +88,7 @@ final class NetworkVideoSender: @unchecked Sendable {
     private var encodedFramesSinceStats = 0
     private var encodedBytesSinceStats = 0
     private var droppedFramesSinceStats = 0
+    private var publishedTally = (program: false, preview: false)
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
     private(set) var deviceName: String = DeviceIdentity.displayName
@@ -115,6 +120,8 @@ final class NetworkVideoSender: @unchecked Sendable {
             self.onStatusChanged?("Stopped")
             self.onInterfaceChanged?("Not connected", false)
             self.onReceiverCountChanged?(0)
+            self.publishedTally = (false, false)
+            self.onTallyChanged?(false, false)
         }
     }
 
@@ -333,6 +340,16 @@ final class NetworkVideoSender: @unchecked Sendable {
             resetBitrate()
         }
         publishClients()
+        // A receiver that is gone cannot keep the camera on air.
+        publishTally()
+    }
+
+    private func publishTally() {
+        let program = clients.contains(where: \.tallyProgram)
+        let preview = !program && clients.contains(where: \.tallyPreview)
+        guard publishedTally != (program, preview) else { return }
+        publishedTally = (program, preview)
+        onTallyChanged?(program, preview)
     }
 
     private func receive(on client: Client) {
@@ -363,6 +380,10 @@ final class NetworkVideoSender: @unchecked Sendable {
                 publishClients()
             case .requestKeyFrame:
                 onRequestKeyFrame?()
+            case .tally:
+                client.tallyProgram = command.program ?? false
+                client.tallyPreview = command.preview ?? false
+                publishTally()
             default:
                 onControlCommand?(command)
             }
@@ -446,9 +467,13 @@ final class NetworkVideoSender: @unchecked Sendable {
     }
 
     private func noteFormat(_ format: H264Format) {
-        let codecChanged = latestFormat?.codec != format.codec
+        let previous = latestFormat
         latestFormat = format
-        guard codecChanged else { return }
+        // A new codec, resolution or frame rate needs a new bitrate budget; a rebuilt encoder at the same
+        // configuration does not.
+        guard previous?.codec != format.codec || previous?.width != format.width
+            || previous?.height != format.height || previous?.fps != format.fps
+        else { return }
         resetBitrate()
         clients.filter(\.isReady).forEach { sendHello(to: $0) }
     }
@@ -457,7 +482,7 @@ final class NetworkVideoSender: @unchecked Sendable {
 
     private func resetBitrate() {
         guard let format = latestFormat else { return }
-        let base = format.codec == CameraProtocol.codecHEVCHVCC ? CameraProtocol.targetBitrateHEVC : CameraProtocol.targetBitrateH264
+        let base = CameraProtocol.baseBitrate(codec: format.codec, width: format.width, height: format.height, fps: format.fps)
         var policy = AdaptiveBitrate(baseBitrate: base, quality: quality)
         policy.pressureScale = pressureScale
         bitrate = policy

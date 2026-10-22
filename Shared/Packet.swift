@@ -172,6 +172,18 @@ public enum CameraControlAction: String, Codable, Equatable, Sendable {
     case requestKeyFrame
     /// A receiver introducing itself right after it connects: how it reached the iPhone and what it is called.
     case identify
+    case toggleTorch
+    case switchCamera
+    /// Locks focus and exposure where they are, or hands both back to auto when either is already fixed.
+    case toggleFocusExposureLock
+    case exposureUp
+    case exposureDown
+    case toggleWhiteBalanceLock
+    /// Focus, exposure and white balance back to auto, exposure bias to zero.
+    case resetImageControls
+    /// Whether the receiver is showing this camera on air (`program`) or only somewhere else (`preview`).
+    /// Sent on change and again on every new connection; the iPhone forgets it when the connection drops.
+    case tally
 }
 
 public enum CameraControlSpeed: String, Codable, Equatable, Sendable {
@@ -187,12 +199,24 @@ public struct CameraControlPayload: Codable, Equatable, Sendable {
     public let transport: String?
     /// `identify` only: the receiver's name, e.g. "OBS on Studio-Mac".
     public let clientName: String?
+    /// `tally` only.
+    public let program: Bool?
+    public let preview: Bool?
 
-    public init(action: CameraControlAction, speed: CameraControlSpeed? = nil, transport: String? = nil, clientName: String? = nil) {
+    public init(
+        action: CameraControlAction,
+        speed: CameraControlSpeed? = nil,
+        transport: String? = nil,
+        clientName: String? = nil,
+        program: Bool? = nil,
+        preview: Bool? = nil
+    ) {
         self.action = action
         self.speed = speed
         self.transport = transport
         self.clientName = clientName
+        self.program = program
+        self.preview = preview
     }
 }
 
@@ -206,13 +230,35 @@ public enum CameraProtocol {
     public static let targetWidth = 1_920
     public static let targetHeight = 1_080
     public static let targetFPS = 60
-    public static let targetBitrateH264 = 12_000_000
-    public static let targetBitrateHEVC = 8_000_000
     public static let targetBitrate = 8_000_000
     /// The iPhone listens here; receivers dial it over Wi-Fi (the phone's IP) or through usbmuxd (USB cable).
     public static let streamPort: UInt16 = 8240
     public static let transportUSB = "usb"
     public static let transportWiFi = "wifi"
+
+    /// The adaptive bitrate loop's starting target for a stream. Sized for 60 fps; faster streams change less
+    /// between frames, so their budget grows less than linearly.
+    public static func baseBitrate(codec: String, width: Int, height: Int, fps: Int) -> Int {
+        let pixels = width * height
+        let h264: Int
+        if pixels <= 1280 * 720 {
+            h264 = 6_000_000
+        } else if pixels <= 1920 * 1080 {
+            h264 = 12_000_000
+        } else {
+            h264 = 40_000_000
+        }
+        // HEVC reaches comparable quality with about two thirds of the bits.
+        let base = codec == codecHEVCHVCC ? h264 * 2 / 3 : h264
+        switch fps {
+        case ...60:
+            return base
+        case ...120:
+            return base * 3 / 2
+        default:
+            return base * 2
+        }
+    }
 }
 
 extension CameraPacket {

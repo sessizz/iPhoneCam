@@ -66,6 +66,9 @@ public:
     SourceStats stats() const;
     void handleZoomHotkey(ControlAction action, ControlSpeed speed, bool pressed);
     void handleResetZoomHotkey(bool pressed);
+    void handleActionHotkey(ControlAction action, bool pressed);
+    // Tells the iPhone whether this source is on air; sends only changes unless forced.
+    void updateTally(bool force);
 
 private:
     void startReceiver();
@@ -113,6 +116,10 @@ private:
     std::chrono::steady_clock::time_point lastKeyFrameRequestAt_{};
     std::chrono::steady_clock::time_point lastTimeSyncAt_{};
     std::atomic<bool> connected_ = false;
+    std::mutex tallyMutex_;
+    bool tallySent_ = false;
+    bool tallyProgram_ = false;
+    bool tallyPreview_ = false;
     std::mutex clockMutex_;
     ClockOffsetEstimator clock_;
     double latencyAverageMs_ = -1;

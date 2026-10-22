@@ -194,6 +194,32 @@ void testIdentifyPayloadEscapesNames()
     assert(json == R"({"action":"identify","transport":"wifi","clientName":"OBS on \"Studio\" Mac"})");
 }
 
+void testTallyAndImageControlPayloads()
+{
+    ControlCommand tally;
+    tally.action = ControlAction::Tally;
+    tally.program = true;
+    const auto tallyPayload = encodeControlPayload(tally);
+    assert(std::string(tallyPayload.begin(), tallyPayload.end()) ==
+           R"({"action":"tally","program":true,"preview":false})");
+
+    const std::pair<ControlAction, const char *> actions[] = {
+        {ControlAction::ToggleTorch, R"({"action":"toggleTorch"})"},
+        {ControlAction::SwitchCamera, R"({"action":"switchCamera"})"},
+        {ControlAction::ToggleFocusExposureLock, R"({"action":"toggleFocusExposureLock"})"},
+        {ControlAction::ExposureUp, R"({"action":"exposureUp"})"},
+        {ControlAction::ExposureDown, R"({"action":"exposureDown"})"},
+        {ControlAction::ToggleWhiteBalanceLock, R"({"action":"toggleWhiteBalanceLock"})"},
+        {ControlAction::ResetImageControls, R"({"action":"resetImageControls"})"},
+    };
+    for (const auto &[action, expected] : actions) {
+        ControlCommand command;
+        command.action = action;
+        const auto payload = encodeControlPayload(command);
+        assert(std::string(payload.begin(), payload.end()) == expected);
+    }
+}
+
 void testNewPacketKindsParse()
 {
     for (const auto kind : {PacketKind::Ping, PacketKind::TimeSyncRequest, PacketKind::TimeSyncResponse}) {
@@ -309,6 +335,7 @@ int main()
     testStaleDrop();
     testJsonPayloads();
     testIdentifyPayloadEscapesNames();
+    testTallyAndImageControlPayloads();
     testNewPacketKindsParse();
     testStreamFramerSplitsAndJoinsChunks();
     testStreamFramerFlagsGarbageLength();

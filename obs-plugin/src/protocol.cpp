@@ -149,6 +149,22 @@ const char *controlActionName(ControlAction action)
         return "requestKeyFrame";
     case ControlAction::Identify:
         return "identify";
+    case ControlAction::ToggleTorch:
+        return "toggleTorch";
+    case ControlAction::SwitchCamera:
+        return "switchCamera";
+    case ControlAction::ToggleFocusExposureLock:
+        return "toggleFocusExposureLock";
+    case ControlAction::ExposureUp:
+        return "exposureUp";
+    case ControlAction::ExposureDown:
+        return "exposureDown";
+    case ControlAction::ToggleWhiteBalanceLock:
+        return "toggleWhiteBalanceLock";
+    case ControlAction::ResetImageControls:
+        return "resetImageControls";
+    case ControlAction::Tally:
+        return "tally";
     }
     return "stopZoom";
 }
@@ -259,6 +275,10 @@ std::vector<uint8_t> encodeControlPayload(const ControlCommand &command)
         appendJsonString(json, command.transport);
         json += ",\"clientName\":";
         appendJsonString(json, command.clientName);
+    }
+    if (command.action == ControlAction::Tally) {
+        json += command.program ? ",\"program\":true" : ",\"program\":false";
+        json += command.preview ? ",\"preview\":true" : ",\"preview\":false";
     }
     json += "}";
     return std::vector<uint8_t>(json.begin(), json.end());
