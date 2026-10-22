@@ -43,7 +43,11 @@ struct ContentView: View {
                 controlOverlay(size: proxy.size, compact: compact)
                     .ignoresSafeArea()
 
-                TallyBorder(program: model.tallyProgram, preview: model.tallyPreview)
+                TallyBorder(
+                    program: model.tallyProgram,
+                    preview: model.tallyPreview,
+                    roundedDisplay: proxy.safeAreaInsets.bottom > 0
+                )
             }
         }
         .sheet(isPresented: $isFormatSheetPresented) {
@@ -1460,9 +1464,12 @@ private struct CameraToolbar: View {
     var body: some View {
         VStack(spacing: compact ? 6 : 10) {
             if tallyProgram || tallyPreview {
+                // Sized to the buttons so switching between ON AIR and PREVIEW does not shift the toolbar.
                 Text(tallyProgram ? "ON AIR" : "PREVIEW")
                     .font(.system(size: 11, weight: .heavy, design: .rounded))
-                    .padding(.horizontal, 8)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.7)
+                    .frame(width: 56)
                     .padding(.vertical, 4)
                     .background(tallyProgram ? Color.red : Color.green, in: Capsule())
                     .foregroundStyle(.white)
@@ -1516,14 +1523,18 @@ private struct CameraToolbar: View {
 }
 
 /// The program/preview frame around the whole screen, so the camera operator sees it from across the room.
+/// Widths and corner handling follow LensLink's tally edge.
 private struct TallyBorder: View {
     let program: Bool
     let preview: Bool
+    /// Phones with a home indicator have rounded display corners that clip a square stroke; there is no public
+    /// API for the exact radius, and a generous continuous curve stays inside every current panel's corner.
+    let roundedDisplay: Bool
 
     var body: some View {
         if program || preview {
-            Rectangle()
-                .strokeBorder(program ? Color.red : Color.green, lineWidth: program ? 8 : 5)
+            RoundedRectangle(cornerRadius: roundedDisplay ? 58 : 0, style: .continuous)
+                .strokeBorder(program ? Color.red : Color.green, lineWidth: program ? 6 : 4)
                 .ignoresSafeArea()
                 .allowsHitTesting(false)
         }
