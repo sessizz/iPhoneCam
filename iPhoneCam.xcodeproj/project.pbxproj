@@ -14,7 +14,6 @@
 		300000000000000000000005 /* CameraPreview.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000005 /* CameraPreview.swift */; };
 		300000000000000000000006 /* CameraCaptureController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000006 /* CameraCaptureController.swift */; };
 		300000000000000000000007 /* H264Encoder.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000007 /* H264Encoder.swift */; };
-		300000000000000000000008 /* BonjourBrowser.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000008 /* BonjourBrowser.swift */; };
 		300000000000000000000009 /* NetworkVideoSender.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000009 /* NetworkVideoSender.swift */; };
 		300000000000000000000010 /* Packet.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000001 /* Packet.swift */; };
 		300000000000000000000011 /* FrameReassembler.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000002 /* FrameReassembler.swift */; };
@@ -22,7 +21,7 @@
 		300000000000000000000013 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000012 /* ContentView.swift */; };
 		300000000000000000000014 /* SampleBufferDisplayView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000013 /* SampleBufferDisplayView.swift */; };
 		300000000000000000000015 /* ReceiverViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000014 /* ReceiverViewModel.swift */; };
-		300000000000000000000016 /* UDPReceiver.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000015 /* UDPReceiver.swift */; };
+		300000000000000000000016 /* StreamTransports.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000015 /* StreamTransports.swift */; };
 		300000000000000000000017 /* H264SampleBuilder.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000016 /* H264SampleBuilder.swift */; };
 		300000000000000000000018 /* Packet.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000001 /* Packet.swift */; };
 		300000000000000000000019 /* FrameReassembler.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000002 /* FrameReassembler.swift */; };
@@ -34,6 +33,11 @@
 		300000000000000000000025 /* BLEJoystickController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000024 /* BLEJoystickController.swift */; };
 		300000000000000000000026 /* BLEZoomProtocol.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000023 /* BLEZoomProtocol.swift */; };
 		300000000000000000000028 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000026 /* Assets.xcassets */; };
+		300000000000000000000031 /* AdaptiveBitrate.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000031 /* AdaptiveBitrate.swift */; };
+		300000000000000000000032 /* AdaptiveBitrate.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000031 /* AdaptiveBitrate.swift */; };
+		300000000000000000000033 /* NetworkInfo.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000032 /* NetworkInfo.swift */; };
+		300000000000000000000034 /* ClockOffsetEstimator.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000033 /* ClockOffsetEstimator.swift */; };
+		300000000000000000000035 /* ClockOffsetEstimator.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000033 /* ClockOffsetEstimator.swift */; };
 		300000000000000000000029 /* DeviceIdentity.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000029 /* DeviceIdentity.swift */; };
 		300000000000000000000030 /* AudioEncoder.swift in Sources */ = {isa = PBXBuildFile; fileRef = 200000000000000000000030 /* AudioEncoder.swift */; };
 /* End PBXBuildFile section */
@@ -49,14 +53,13 @@
 		200000000000000000000005 /* CameraPreview.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CameraPreview.swift; sourceTree = "<group>"; };
 		200000000000000000000006 /* CameraCaptureController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CameraCaptureController.swift; sourceTree = "<group>"; };
 		200000000000000000000007 /* H264Encoder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = H264Encoder.swift; sourceTree = "<group>"; };
-		200000000000000000000008 /* BonjourBrowser.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BonjourBrowser.swift; sourceTree = "<group>"; };
 		200000000000000000000009 /* NetworkVideoSender.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NetworkVideoSender.swift; sourceTree = "<group>"; };
 		200000000000000000000010 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		200000000000000000000011 /* macOSReceiverApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = macOSReceiverApp.swift; sourceTree = "<group>"; };
 		200000000000000000000012 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
 		200000000000000000000013 /* SampleBufferDisplayView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SampleBufferDisplayView.swift; sourceTree = "<group>"; };
 		200000000000000000000014 /* ReceiverViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReceiverViewModel.swift; sourceTree = "<group>"; };
-		200000000000000000000015 /* UDPReceiver.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UDPReceiver.swift; sourceTree = "<group>"; };
+		200000000000000000000015 /* StreamTransports.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StreamTransports.swift; sourceTree = "<group>"; };
 		200000000000000000000016 /* H264SampleBuilder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = H264SampleBuilder.swift; sourceTree = "<group>"; };
 		200000000000000000000017 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		200000000000000000000018 /* macOSReceiver.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = macOSReceiver.entitlements; sourceTree = "<group>"; };
@@ -68,6 +71,9 @@
 		200000000000000000000024 /* BLEJoystickController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BLEJoystickController.swift; sourceTree = "<group>"; };
 		200000000000000000000025 /* AppIcon.icns */ = {isa = PBXFileReference; lastKnownFileType = image.icns; path = AppIcon.icns; sourceTree = "<group>"; };
 		200000000000000000000026 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		200000000000000000000031 /* AdaptiveBitrate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AdaptiveBitrate.swift; sourceTree = "<group>"; };
+		200000000000000000000032 /* NetworkInfo.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NetworkInfo.swift; sourceTree = "<group>"; };
+		200000000000000000000033 /* ClockOffsetEstimator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ClockOffsetEstimator.swift; sourceTree = "<group>"; };
 		200000000000000000000029 /* DeviceIdentity.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DeviceIdentity.swift; sourceTree = "<group>"; };
 		200000000000000000000030 /* AudioEncoder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AudioEncoder.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
@@ -124,6 +130,8 @@
 				200000000000000000000001 /* Packet.swift */,
 				200000000000000000000002 /* FrameReassembler.swift */,
 				200000000000000000000023 /* BLEZoomProtocol.swift */,
+				200000000000000000000031 /* AdaptiveBitrate.swift */,
+				200000000000000000000033 /* ClockOffsetEstimator.swift */,
 			);
 			path = Shared;
 			sourceTree = "<group>";
@@ -137,8 +145,8 @@
 				200000000000000000000006 /* CameraCaptureController.swift */,
 				200000000000000000000007 /* H264Encoder.swift */,
 				200000000000000000000030 /* AudioEncoder.swift */,
-				200000000000000000000008 /* BonjourBrowser.swift */,
 				200000000000000000000009 /* NetworkVideoSender.swift */,
+				200000000000000000000032 /* NetworkInfo.swift */,
 				200000000000000000000029 /* DeviceIdentity.swift */,
 				200000000000000000000024 /* BLEJoystickController.swift */,
 				200000000000000000000010 /* Info.plist */,
@@ -156,7 +164,7 @@
 				200000000000000000000013 /* SampleBufferDisplayView.swift */,
 				200000000000000000000014 /* ReceiverViewModel.swift */,
 				200000000000000000000020 /* ReceiverPacketProcessor.swift */,
-				200000000000000000000015 /* UDPReceiver.swift */,
+				200000000000000000000015 /* StreamTransports.swift */,
 				200000000000000000000016 /* H264SampleBuilder.swift */,
 				200000000000000000000017 /* Info.plist */,
 				200000000000000000000025 /* AppIcon.icns */,
@@ -334,8 +342,9 @@
 				300000000000000000000006 /* CameraCaptureController.swift in Sources */,
 				300000000000000000000007 /* H264Encoder.swift in Sources */,
 				300000000000000000000030 /* AudioEncoder.swift in Sources */,
-				300000000000000000000008 /* BonjourBrowser.swift in Sources */,
 				300000000000000000000009 /* NetworkVideoSender.swift in Sources */,
+				300000000000000000000033 /* NetworkInfo.swift in Sources */,
+				300000000000000000000031 /* AdaptiveBitrate.swift in Sources */,
 				300000000000000000000029 /* DeviceIdentity.swift in Sources */,
 				300000000000000000000025 /* BLEJoystickController.swift in Sources */,
 			);
@@ -347,12 +356,13 @@
 			files = (
 				300000000000000000000010 /* Packet.swift in Sources */,
 				300000000000000000000011 /* FrameReassembler.swift in Sources */,
+				300000000000000000000034 /* ClockOffsetEstimator.swift in Sources */,
 				300000000000000000000012 /* macOSReceiverApp.swift in Sources */,
 				300000000000000000000013 /* ContentView.swift in Sources */,
 				300000000000000000000014 /* SampleBufferDisplayView.swift in Sources */,
 				300000000000000000000015 /* ReceiverViewModel.swift in Sources */,
 				300000000000000000000021 /* ReceiverPacketProcessor.swift in Sources */,
-				300000000000000000000016 /* UDPReceiver.swift in Sources */,
+				300000000000000000000016 /* StreamTransports.swift in Sources */,
 				300000000000000000000017 /* H264SampleBuilder.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -364,6 +374,8 @@
 				300000000000000000000018 /* Packet.swift in Sources */,
 				300000000000000000000019 /* FrameReassembler.swift in Sources */,
 				300000000000000000000026 /* BLEZoomProtocol.swift in Sources */,
+				300000000000000000000032 /* AdaptiveBitrate.swift in Sources */,
+				300000000000000000000035 /* ClockOffsetEstimator.swift in Sources */,
 				300000000000000000000020 /* SharedProtocolTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;

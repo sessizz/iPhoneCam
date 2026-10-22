@@ -277,4 +277,138 @@ final class SharedProtocolTests: XCTestCase {
 
         XCTAssertNil(framer.nextPacket())
     }
+
+    func testFramedHeaderPlusPayloadMatchesFramedPacket() {
+        let packet = CameraPacket(
+            kind: .frameFragment,
+            flags: .keyFrame,
+            streamId: 1,
+            frameId: 77,
+            ptsNanos: 123,
+            payload: Data(repeating: 0x5A, count: 3000)
+        )
+        var split = packet.framedTCPHeader()
+        XCTAssertEqual(split.count, 4 + CameraPacket.headerLength)
+        split.append(packet.payload)
+        XCTAssertEqual(split, packet.framedForTCP())
+    }
+
+    func testPingAndTimeSyncPacketsRoundTrip() throws {
+        for kind in [CameraPacketKind.ping, .timeSyncRequest, .timeSyncResponse] {
+            let packet = CameraPacket(kind: kind, streamId: 1, ptsNanos: 42, payload: Data([0, 0, 0, 0, 0, 0, 0, 7]))
+            XCTAssertEqual(CameraPacket(data: packet.encoded()), packet)
+        }
+    }
+
+    func testIdentifyDecodesOBSPayload() throws {
+        let data = Data(#"{"action":"identify","transport":"usb","clientName":"OBS on \"Studio\" Mac"}"#.utf8)
+        let payload = try JSONDecoder().decode(CameraControlPayload.self, from: data)
+
+        XCTAssertEqual(payload.action, .identify)
+        XCTAssertEqual(payload.transport, CameraProtocol.transportUSB)
+        XCTAssertEqual(payload.clientName, #"OBS on "Studio" Mac"#)
+    }
+
+    func testTCPPacketFramerStopsOnOversizedLength() {
+        var framer = TCPPacketFramer()
+        framer.append(Data([0x7F, 0xFF, 0xFF, 0xFF, 0x00]))
+        XCTAssertNil(framer.nextPacket())
+        XCTAssertTrue(framer.isDesynced)
+
+        // Bytes after a desync are not parsed as packets; only a reset (a new connection) recovers.
+        framer.append(CameraPacket(kind: .ping, streamId: 1, payload: Data()).framedForTCP())
+        XCTAssertNil(framer.nextPacket())
+        framer.reset()
+        XCTAssertFalse(framer.isDesynced)
+    }
+
+    func testBalancedBitrateBacksOffAndRecoversSlowly() {
+        var policy = AdaptiveBitrate(baseBitrate: 8_000_000, quality: .balanced)
+        XCTAssertEqual(policy.current, 8_000_000)
+
+        let congested = AdaptiveBitrate.Sample(droppedFrames: 2, maxSendDelayMs: 10, allUSB: false)
+        XCTAssertEqual(policy.update(congested), 6_000_000)
+        let slowSends = AdaptiveBitrate.Sample(droppedFrames: 0, maxSendDelayMs: 250, allUSB: false)
+        XCTAssertEqual(policy.update(slowSends), 4_500_000)
+
+        let clean = AdaptiveBitrate.Sample(droppedFrames: 0, maxSendDelayMs: 20, allUSB: false)
+        for _ in 0..<9 {
+            XCTAssertNil(policy.update(clean))
+        }
+        XCTAssertEqual(policy.update(clean), 4_950_000)
+
+        // Balanced never climbs past the codec target.
+        for _ in 0..<200 {
+            _ = policy.update(clean)
+        }
+        XCTAssertEqual(policy.current, 8_000_000)
+    }
+
+    func testBitrateNeverDropsBelowMinimum() {
+        var policy = AdaptiveBitrate(baseBitrate: 1_200_000, quality: .balanced)
+        let congested = AdaptiveBitrate.Sample(droppedFrames: 1, maxSendDelayMs: 0, allUSB: false)
+        for _ in 0..<10 {
+            _ = policy.update(congested)
+        }
+        XCTAssertEqual(policy.current, AdaptiveBitrate.minimumBitrate)
+    }
+
+    func testMaximumProbesToTransportCeiling() {
+        var policy = AdaptiveBitrate(baseBitrate: 8_000_000, quality: .maximum)
+        XCTAssertEqual(policy.current, 12_000_000)
+        XCTAssertEqual(policy.ceiling(allUSB: true), 28_000_000)
+        XCTAssertEqual(policy.ceiling(allUSB: false), 20_000_000)
+
+        let cleanUSB = AdaptiveBitrate.Sample(droppedFrames: 0, maxSendDelayMs: 5, allUSB: true)
+        XCTAssertNil(policy.update(cleanUSB))
+        XCTAssertNil(policy.update(cleanUSB))
+        XCTAssertEqual(policy.update(cleanUSB), 13_800_000)
+        for _ in 0..<100 {
+            _ = policy.update(cleanUSB)
+        }
+        XCTAssertEqual(policy.current, 28_000_000)
+
+        // A Wi-Fi receiver joining lowers the ceiling right away.
+        let cleanWiFi = AdaptiveBitrate.Sample(droppedFrames: 0, maxSendDelayMs: 5, allUSB: false)
+        XCTAssertEqual(policy.update(cleanWiFi), 20_000_000)
+    }
+
+    func testMaximumHoldsWhileSendsQueueAndSettlesBelowBreakingLevel() {
+        var policy = AdaptiveBitrate(baseBitrate: 8_000_000, quality: .maximum)
+        let queueing = AdaptiveBitrate.Sample(droppedFrames: 0, maxSendDelayMs: 100, allUSB: true)
+        for _ in 0..<10 {
+            XCTAssertNil(policy.update(queueing))
+        }
+
+        let congested = AdaptiveBitrate.Sample(droppedFrames: 1, maxSendDelayMs: 0, allUSB: true)
+        XCTAssertEqual(policy.update(congested), 9_000_000)
+        let clean = AdaptiveBitrate.Sample(droppedFrames: 0, maxSendDelayMs: 5, allUSB: true)
+        for _ in 0..<30 {
+            _ = policy.update(clean)
+        }
+        // Within a minute of breaking at 12 Mbps it stays at 90% of that.
+        XCTAssertEqual(policy.current, 10_800_000)
+    }
+
+    func testPressureScaleLowersCeiling() {
+        var policy = AdaptiveBitrate(baseBitrate: 8_000_000, quality: .balanced)
+        policy.pressureScale = 0.5
+        let clean = AdaptiveBitrate.Sample(droppedFrames: 0, maxSendDelayMs: 5, allUSB: true)
+        XCTAssertEqual(policy.update(clean), 4_000_000)
+    }
+
+    func testClockOffsetUsesLowestRoundTrip() throws {
+        var clock = ClockOffsetEstimator()
+        XCTAssertFalse(clock.isReady)
+        // Phone clock runs 5 s ahead. A slow round trip whose reply came back late skews its midpoint, so the
+        // 2 ms sample must win.
+        clock.addSample(localSendNanos: 1_000_000_000, phoneNanos: 6_030_000_000, localReceiveNanos: 1_040_000_000)
+        clock.addSample(localSendNanos: 2_000_000_000, phoneNanos: 7_001_000_000, localReceiveNanos: 2_002_000_000)
+        XCTAssertEqual(clock.roundTripNanos, 2_000_000)
+        XCTAssertEqual(clock.offsetNanos, 5_000_000_000)
+        XCTAssertEqual(clock.localNanos(forPhoneNanos: 7_500_000_000), 2_500_000_000)
+
+        XCTAssertEqual(ClockOffsetEstimator.echoedClock(in: Data([0, 0, 0, 0, 0x3B, 0x9A, 0xCA, 0x00])), 1_000_000_000)
+        XCTAssertNil(ClockOffsetEstimator.echoedClock(in: Data([1, 2, 3])))
+    }
 }

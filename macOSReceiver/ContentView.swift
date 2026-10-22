@@ -60,20 +60,43 @@ struct ContentView: View {
                             .foregroundStyle(Color.white)
                     }
 
-                    // Device Picker Dropdown
-                    Picker("Device", selection: $model.selectedDevice) {
-                        ForEach(model.availableDevices, id: \.self) { dev in
-                            Text(dev).tag(dev)
+                    Picker("Source", selection: Binding(
+                        get: { model.selectedSource },
+                        set: { model.selectSource($0) }
+                    )) {
+                        Text("Auto").tag(ReceiverSource.auto)
+                        Text("USB Cable").tag(ReceiverSource.usb)
+                        ForEach(model.phones, id: \.self) { phone in
+                            Text("\(phone) (Wi-Fi)").tag(ReceiverSource.phone(phone))
+                        }
+                        // Keep a saved choice selectable before discovery finds it again.
+                        switch model.selectedSource {
+                        case .phone(let phone) where !model.phones.contains(phone):
+                            Text("\(phone) (Wi-Fi)").tag(model.selectedSource)
+                        case .address(let address):
+                            Text(address).tag(model.selectedSource)
+                        default:
+                            EmptyView()
                         }
                     }
                     .pickerStyle(.menu)
+                    .labelsHidden()
                     .font(.system(size: 11, weight: .bold, design: .rounded))
-                    .padding(.horizontal, 4)
-                    .padding(.vertical, 1)
-                    .background(Color.white.opacity(0.18), in: RoundedRectangle(cornerRadius: 6))
-                    .onChange(of: model.selectedDevice) { _, newValue in
-                        model.selectDevice(newValue)
+                    .fixedSize()
+                }
+
+                HStack(spacing: 6) {
+                    TextField("iPhone IP (shown in the app)", text: $model.manualAddress)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.system(size: 12, design: .monospaced))
+                        .frame(width: 210)
+                        .onSubmit {
+                            model.connectToManualAddress()
+                        }
+                    Button("Connect") {
+                        model.connectToManualAddress()
                     }
+                    .disabled(model.manualAddress.trimmingCharacters(in: .whitespaces).isEmpty)
                 }
 
                 VStack(alignment: .leading, spacing: 4) {

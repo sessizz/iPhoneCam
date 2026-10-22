@@ -95,6 +95,8 @@ final class CameraCaptureController: NSObject, ObservableObject, @unchecked Send
     var onEncodedSample: ((EncodedH264Sample) -> Void)?
     var onPreviewSample: ((CMSampleBuffer) -> Void)?
     var onAudioSample: ((EncodedAudioSample) -> Void)?
+    /// 1 normally, 0.5 at serious and 0.25 at critical thermal/power pressure; scales the stream's bitrate.
+    var onPressureScaleChanged: ((Double) -> Void)?
 
     private let sessionQueue = DispatchQueue(label: "iphonecam.capture.session")
     private let audioQueue = DispatchQueue(label: "iphonecam.capture.audio")
@@ -104,6 +106,10 @@ final class CameraCaptureController: NSObject, ObservableObject, @unchecked Send
     private let audioEncoder = AudioEncoder()
     private var captureDevice: AVCaptureDevice?
     private var encoder: H264Encoder?
+    private var activeQuality: StreamQuality = .balanced
+    /// The adaptive bitrate loop's current target; nil until it speaks, which means the codec default.
+    private var targetBitrate: Int?
+    private var pressureObservation: NSKeyValueObservation?
     private var zoomPollTimer: DispatchSourceTimer?
     private var configured = false
     private var selectedCameraFormat: SelectedCameraFormat?
@@ -307,23 +313,75 @@ final class CameraCaptureController: NSObject, ObservableObject, @unchecked Send
             DispatchQueue.main.async {
                 self.activeCodec = codec
             }
-            guard let selected = self.selectedCameraFormat else { return }
-            let encoder = H264Encoder(
-                codec: codec,
-                width: selected.width,
-                height: selected.height,
-                fps: selected.fps
-            )
-            encoder.onFormat = { [weak self] format in
-                self?.onFormat?(format)
+            // The sender resets its bitrate policy for the new codec and reports the new target.
+            self.targetBitrate = nil
+            self.rebuildEncoder()
+        }
+    }
+
+    func setQuality(_ quality: StreamQuality) {
+        sessionQueue.async { [weak self] in
+            guard let self, self.activeQuality != quality else { return }
+            self.activeQuality = quality
+            self.targetBitrate = nil
+            self.rebuildEncoder()
+        }
+    }
+
+    func setBitrate(_ bitsPerSecond: Int) {
+        sessionQueue.async { [weak self] in
+            guard let self else { return }
+            self.targetBitrate = bitsPerSecond
+            guard let encoder = self.encoder else { return }
+            if bitsPerSecond > encoder.appliedBitrate {
+                // A raise only takes effect in a fresh compression session; the cost is one keyframe.
+                self.rebuildEncoder()
+            } else {
+                encoder.setBitrate(bitsPerSecond)
             }
-            encoder.onSample = { [weak self] sample in
-                self?.onEncodedSample?(sample)
+        }
+    }
+
+    private func rebuildEncoder() {
+        guard let selected = selectedCameraFormat else { return }
+        encoder = makeEncoder(for: selected)
+        let codec = activeCodec
+        DispatchQueue.main.async {
+            self.activeFormatText = "\(selected.width)x\(selected.height) @ \(selected.fps) FPS (\(codec.rawValue))"
+        }
+    }
+
+    private func makeEncoder(for selected: SelectedCameraFormat) -> H264Encoder {
+        let encoder = H264Encoder(
+            codec: activeCodec,
+            quality: activeQuality,
+            width: selected.width,
+            height: selected.height,
+            fps: selected.fps,
+            bitrate: targetBitrate
+        )
+        encoder.onFormat = { [weak self] format in
+            self?.onFormat?(format)
+        }
+        encoder.onSample = { [weak self] sample in
+            self?.onEncodedSample?(sample)
+        }
+        return encoder
+    }
+
+    /// Per the systemPressureState guidance: shed bitrate before the system starts shedding frames for us.
+    private func observeSystemPressure(on device: AVCaptureDevice) {
+        pressureObservation = device.observe(\.systemPressureState, options: [.initial, .new]) { [weak self] device, _ in
+            let scale: Double
+            switch device.systemPressureState.level {
+            case .serious:
+                scale = 0.5
+            case .critical, .shutdown:
+                scale = 0.25
+            default:
+                scale = 1
             }
-            self.encoder = encoder
-            DispatchQueue.main.async {
-                self.activeFormatText = "\(selected.width)x\(selected.height) @ \(selected.fps) FPS (\(codec.rawValue))"
-            }
+            self?.onPressureScaleChanged?(scale)
         }
     }
 
@@ -334,19 +392,7 @@ final class CameraCaptureController: NSObject, ObservableObject, @unchecked Send
                 if !self.configured {
                     let selected = try self.configureSession()
                     self.selectedCameraFormat = selected
-                    let encoder = H264Encoder(
-                        codec: self.activeCodec,
-                        width: selected.width,
-                        height: selected.height,
-                        fps: selected.fps
-                    )
-                    encoder.onFormat = { [weak self] format in
-                        self?.onFormat?(format)
-                    }
-                    encoder.onSample = { [weak self] sample in
-                        self?.onEncodedSample?(sample)
-                    }
-                    self.encoder = encoder
+                    self.encoder = self.makeEncoder(for: selected)
                     self.audioEncoder.onSample = { [weak self] sample in
                         self?.onAudioSample?(sample)
                     }
@@ -389,6 +435,7 @@ final class CameraCaptureController: NSObject, ObservableObject, @unchecked Send
         let device = selection.device
         let selected = selection.format
         captureDevice = device
+        observeSystemPressure(on: device)
         selectedFormatWarning = selected.warning
         displayZoomFactorMultiplier = Self.displayZoomFactorMultiplier(for: device)
 

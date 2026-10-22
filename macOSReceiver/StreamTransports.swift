@@ -1,213 +1,253 @@
 import Foundation
 import Network
 
-final class UDPReceiver: @unchecked Sendable {
-    var onStatusChanged: ((String) -> Void)?
-    var onPacket: ((CameraPacket) -> Void)?
-    var onInterfaceChanged: ((_ interfaceDescription: String, _ isWired: Bool) -> Void)?
-
-    private let queue = DispatchQueue(label: "iphonecam.receiver.udp")
-    private var listener: NWListener?
-    private var connections: [ObjectIdentifier: NWConnection] = [:]
-    private var timeoutTimer: DispatchSourceTimer?
-    private var hasActiveSender = false
-    private var activeConnectionId: ObjectIdentifier?
-    private var lastPacketAt: Date?
-    private var targetDeviceName: String = ""
-
-    func setTargetDevice(_ name: String) {
-        queue.async { [weak self] in
-            guard let self else { return }
-            self.targetDeviceName = (name == "Auto" ? "" : name)
-            self.updateBonjourService()
-        }
+enum ReceiverIdentity {
+    static func identify(transport: String) -> CameraControlPayload {
+        let host = Host.current().localizedName ?? "Mac"
+        return CameraControlPayload(action: .identify, transport: transport, clientName: "iPhoneCam Receiver on \(host)")
     }
+}
 
-    func start() {
-        queue.async { [weak self] in
-            guard let self else { return }
-            do {
-                let parameters = NWParameters.udp
-                parameters.includePeerToPeer = true
-                parameters.serviceClass = .interactiveVideo
-                let listener = try NWListener(using: parameters, on: 0)
-                let target = self.targetDeviceName.isEmpty ? "*" : self.targetDeviceName
-                var txtDict: [String: Data] = [:]
-                if let targetData = target.data(using: .utf8) {
-                    txtDict["target"] = targetData
-                }
-                let txtRecordData = NetService.data(fromTXTRecord: txtDict)
-                listener.service = NWListener.Service(
-                    name: Host.current().localizedName ?? "iPhoneCam Mac",
-                    type: CameraProtocol.serviceType,
-                    txtRecord: txtRecordData
-                )
-                listener.stateUpdateHandler = { [weak self] state in
-                    self?.handleState(state)
-                }
-                listener.newConnectionHandler = { [weak self] connection in
-                    self?.accept(connection)
-                }
-                self.listener = listener
-                listener.start(queue: self.queue)
-            } catch {
-                self.onStatusChanged?("Receiver failed: \(error.localizedDescription)")
+// MARK: - PhoneConnection (dials the iPhone over the network)
+
+/// Dials the iPhone's stream listener by Bonjour name or IP address and keeps redialing until told to stop.
+final class PhoneConnection: @unchecked Sendable {
+    enum Target: Equatable {
+        case service(String)
+        case address(String)
+
+        var description: String {
+            switch self {
+            case .service(let name):
+                return name
+            case .address(let address):
+                return address
             }
         }
     }
 
-    private func updateBonjourService() {
-        guard let listener else { return }
-        let target = targetDeviceName.isEmpty ? "*" : targetDeviceName
-        var txtDict: [String: Data] = [:]
-        if let targetData = target.data(using: .utf8) {
-            txtDict["target"] = targetData
+    var onPacket: ((CameraPacket) -> Void)?
+    var onStateChanged: ((_ connected: Bool, _ status: String) -> Void)?
+
+    /// The iPhone pings every 2 s, so this much silence means the link is gone even if TCP has not noticed.
+    private static let idleTimeout: TimeInterval = 6
+    private static let retryDelay: TimeInterval = 1
+
+    private let queue = DispatchQueue(label: "iphonecam.receiver.phone", qos: .userInteractive)
+    private var target: Target?
+    private var connection: NWConnection?
+    private var framer = TCPPacketFramer()
+    /// Identifies the current attempt; callbacks from older connections are ignored.
+    private var generation = 0
+    private var isConnected = false
+    private var lastDataAt = Date.distantPast
+    private var watchdog: DispatchSourceTimer?
+
+    func connect(to target: Target) {
+        queue.async { [weak self] in
+            guard let self, self.target != target || self.connection == nil else { return }
+            self.target = target
+            self.open()
         }
-        let txtRecordData = NetService.data(fromTXTRecord: txtDict)
-        listener.service = NWListener.Service(
-            name: Host.current().localizedName ?? "iPhoneCam Mac",
-            type: CameraProtocol.serviceType,
-            txtRecord: txtRecordData
-        )
+    }
+
+    func disconnect() {
+        queue.async { [weak self] in
+            guard let self, self.target != nil else { return }
+            self.target = nil
+            self.generation += 1
+            self.closeConnection()
+            self.stopWatchdog()
+        }
+    }
+
+    func send(_ command: CameraControlPayload) {
+        guard let payload = try? JSONEncoder().encode(command) else { return }
+        send(CameraPacket(kind: .control, streamId: CameraProtocol.streamId, payload: payload))
+    }
+
+    func send(_ packet: CameraPacket) {
+        let framed = packet.framedForTCP()
+        queue.async { [weak self] in
+            guard let self, self.isConnected, let connection = self.connection else { return }
+            connection.send(content: framed, completion: .contentProcessed { _ in })
+        }
+    }
+
+    private static func endpoint(for target: Target) -> NWEndpoint? {
+        switch target {
+        case .service(let name):
+            return .service(name: name, type: CameraProtocol.phoneServiceType, domain: "local.", interface: nil)
+        case .address(let text):
+            var host = text.trimmingCharacters(in: .whitespaces)
+            var port = CameraProtocol.streamPort
+            if host.hasPrefix("["), let close = host.firstIndex(of: "]") {
+                let rest = host[host.index(after: close)...]
+                if rest.hasPrefix(":"), let value = UInt16(rest.dropFirst()) {
+                    port = value
+                }
+                host = String(host[host.index(after: host.startIndex)..<close])
+            } else if host.filter({ $0 == ":" }).count == 1, let colon = host.firstIndex(of: ":") {
+                guard let value = UInt16(host[host.index(after: colon)...]) else { return nil }
+                port = value
+                host = String(host[..<colon])
+            }
+            guard !host.isEmpty, let nwPort = NWEndpoint.Port(rawValue: port) else { return nil }
+            return .hostPort(host: NWEndpoint.Host(host), port: nwPort)
+        }
+    }
+
+    private static func parameters() -> NWParameters {
+        let tcp = NWProtocolTCP.Options()
+        tcp.noDelay = true
+        tcp.connectionTimeout = 3
+        tcp.enableKeepalive = true
+        tcp.keepaliveIdle = 5
+        tcp.keepaliveInterval = 5
+        tcp.keepaliveCount = 2
+        return NWParameters(tls: nil, tcp: tcp)
+    }
+
+    private func open() {
+        closeConnection()
+        generation += 1
+        guard let target else { return }
+        guard let endpoint = Self.endpoint(for: target) else {
+            onStateChanged?(false, "Invalid address: \(target.description)")
+            return
+        }
+
+        let generation = generation
+        let connection = NWConnection(to: endpoint, using: Self.parameters())
+        self.connection = connection
+        framer.reset()
+        connection.stateUpdateHandler = { [weak self] state in
+            guard let self, self.generation == generation else { return }
+            switch state {
+            case .ready:
+                self.isConnected = true
+                self.lastDataAt = Date()
+                self.onStateChanged?(true, "Connected to \(target.description) via Wi-Fi")
+                self.startWatchdog()
+                self.receive(on: connection, generation: generation)
+                self.send(ReceiverIdentity.identify(transport: CameraProtocol.transportWiFi))
+            case .waiting(let error):
+                // Typically "connection refused" while iPhoneCam is not open; redial on our own schedule.
+                self.onStateChanged?(false, "Waiting for \(target.description): \(error.localizedDescription)")
+                self.reconnectLater(generation)
+            case .failed(let error):
+                self.onStateChanged?(false, "Lost \(target.description): \(error.localizedDescription)")
+                self.reconnectLater(generation)
+            default:
+                break
+            }
+        }
+        onStateChanged?(false, "Connecting to \(target.description)...")
+        connection.start(queue: queue)
+    }
+
+    private func receive(on connection: NWConnection, generation: Int) {
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 256 * 1024) { [weak self] data, _, isComplete, error in
+            guard let self, self.generation == generation else { return }
+            if let data, !data.isEmpty {
+                self.lastDataAt = Date()
+                self.framer.append(data)
+                while let packet = self.framer.nextPacket() {
+                    self.onPacket?(packet)
+                }
+            }
+            if isComplete || error != nil || self.framer.isDesynced {
+                self.onStateChanged?(false, "Disconnected from \(self.target?.description ?? "iPhone"), reconnecting...")
+                self.reconnectLater(generation)
+                return
+            }
+            self.receive(on: connection, generation: generation)
+        }
+    }
+
+    private func reconnectLater(_ generation: Int) {
+        guard self.generation == generation else { return }
+        closeConnection()
+        queue.asyncAfter(deadline: .now() + Self.retryDelay) { [weak self] in
+            guard let self, self.generation == generation, self.target != nil else { return }
+            self.open()
+        }
+    }
+
+    private func closeConnection() {
+        isConnected = false
+        connection?.stateUpdateHandler = nil
+        connection?.cancel()
+        connection = nil
+    }
+
+    private func startWatchdog() {
+        guard watchdog == nil else { return }
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now() + 1, repeating: 1)
+        timer.setEventHandler { [weak self] in
+            guard let self, self.isConnected, Date().timeIntervalSince(self.lastDataAt) > Self.idleTimeout else { return }
+            self.onStateChanged?(false, "No data from \(self.target?.description ?? "iPhone"), reconnecting...")
+            self.reconnectLater(self.generation)
+        }
+        timer.resume()
+        watchdog = timer
+    }
+
+    private func stopWatchdog() {
+        watchdog?.cancel()
+        watchdog = nil
+    }
+}
+
+// MARK: - PhoneBrowser (Bonjour discovery of iPhones running iPhoneCam)
+
+final class PhoneBrowser: @unchecked Sendable {
+    var onPhonesChanged: (([String]) -> Void)?
+
+    private let queue = DispatchQueue(label: "iphonecam.receiver.browser")
+    private var browser: NWBrowser?
+    private var isRunning = false
+
+    func start() {
+        queue.async { [weak self] in
+            guard let self, !self.isRunning else { return }
+            self.isRunning = true
+            self.startBrowser()
+        }
     }
 
     func stop() {
         queue.async { [weak self] in
-            self?.listener?.cancel()
-            self?.listener = nil
-            self?.timeoutTimer?.cancel()
-            self?.timeoutTimer = nil
-            self?.connections.values.forEach { $0.cancel() }
-            self?.connections.removeAll()
-            self?.hasActiveSender = false
-            self?.activeConnectionId = nil
-            self?.lastPacketAt = nil
-        }
-    }
-
-    private func handleState(_ state: NWListener.State) {
-        switch state {
-        case .ready:
-            startTimeoutTimer()
-            if let port = listener?.port {
-                onStatusChanged?("Waiting for iPhone on UDP \(port.rawValue)")
-            } else {
-                onStatusChanged?("Waiting for iPhone")
-            }
-        case .failed(let error):
-            onStatusChanged?("Receiver failed: \(error.localizedDescription)")
-        case .waiting(let error):
-            onStatusChanged?("Receiver waiting: \(error.localizedDescription)")
-        case .cancelled:
-            onStatusChanged?("Receiver stopped")
-        default:
-            break
-        }
-    }
-
-    func sendControlCommand(_ command: CameraControlPayload) {
-        queue.async { [weak self] in
             guard let self else { return }
-            guard let payload = try? JSONEncoder().encode(command) else { return }
-            let packet = CameraPacket(kind: .control, streamId: CameraProtocol.streamId, payload: payload)
-            let data = packet.encoded()
-            if let activeId = self.activeConnectionId, let conn = self.connections[activeId] {
-                conn.send(content: data, completion: .contentProcessed({ _ in }))
-            } else {
-                for conn in self.connections.values {
-                    conn.send(content: data, completion: .contentProcessed({ _ in }))
+            self.isRunning = false
+            self.browser?.cancel()
+            self.browser = nil
+        }
+    }
+
+    private func startBrowser() {
+        let browser = NWBrowser(for: .bonjour(type: CameraProtocol.phoneServiceType, domain: nil), using: .tcp)
+        browser.browseResultsChangedHandler = { [weak self] results, _ in
+            let names = results.compactMap { result -> String? in
+                if case .service(let name, _, _, _) = result.endpoint {
+                    return name
                 }
+                return nil
+            }
+            self?.onPhonesChanged?(Array(Set(names)).sorted())
+        }
+        browser.stateUpdateHandler = { [weak self, weak browser] state in
+            guard let self, case .failed = state else { return }
+            browser?.cancel()
+            self.browser = nil
+            self.queue.asyncAfter(deadline: .now() + 2) { [weak self] in
+                guard let self, self.isRunning, self.browser == nil else { return }
+                self.startBrowser()
             }
         }
-    }
-
-    private func accept(_ connection: NWConnection) {
-        let id = ObjectIdentifier(connection)
-        connections[id] = connection
-        connection.stateUpdateHandler = { [weak self, weak connection] state in
-            guard let connection else { return }
-            if case .cancelled = state {
-                self?.connections.removeValue(forKey: ObjectIdentifier(connection))
-            }
-        }
-        connection.start(queue: queue)
-        receive(on: connection)
-    }
-
-    private func isWiredUSBConnection(_ connection: NWConnection) -> Bool {
-        if let path = connection.currentPath {
-            if path.usesInterfaceType(.wifi) || path.usesInterfaceType(.cellular) {
-                return false
-            }
-            if path.usesInterfaceType(.wiredEthernet) {
-                return true
-            }
-            let hasUSBInterface = path.availableInterfaces.contains { iface in
-                iface.type == .wiredEthernet ||
-                iface.name.lowercased().contains("usb") ||
-                (iface.name.lowercased().hasPrefix("en") && iface.name != "en0")
-            }
-            if hasUSBInterface {
-                return true
-            }
-        }
-        return false
-    }
-
-    private func receive(on connection: NWConnection) {
-        connection.receiveMessage { [weak self, weak connection] data, _, _, error in
-            guard let self, let connection else { return }
-            let id = ObjectIdentifier(connection)
-
-            if let data, let packet = CameraPacket(data: data) {
-                let now = Date()
-                if self.activeConnectionId == nil || self.activeConnectionId == id {
-                    let wasInactive = !self.hasActiveSender
-                    self.activeConnectionId = id
-                    self.hasActiveSender = true
-                    self.lastPacketAt = now
-                    if wasInactive {
-                        let isWired = self.isWiredUSBConnection(connection)
-                        self.onInterfaceChanged?(isWired ? "USB (High-Speed Cable)" : "Wi-Fi", isWired)
-                    }
-                    self.onPacket?(packet)
-                } else if let last = self.lastPacketAt, now.timeIntervalSince(last) > 1.5 {
-                    self.activeConnectionId = id
-                    self.hasActiveSender = true
-                    self.lastPacketAt = now
-                    let isWired = self.isWiredUSBConnection(connection)
-                    self.onInterfaceChanged?(isWired ? "USB (High-Speed Cable)" : "Wi-Fi", isWired)
-                    self.onPacket?(packet)
-                }
-            }
-            if error == nil {
-                self.receive(on: connection)
-            }
-        }
-    }
-
-    private func startTimeoutTimer() {
-        timeoutTimer?.cancel()
-        let timer = DispatchSource.makeTimerSource(queue: queue)
-        timer.schedule(deadline: .now() + 0.5, repeating: 0.5)
-        timer.setEventHandler { [weak self] in
-            self?.checkSenderTimeout()
-        }
-        timeoutTimer = timer
-        timer.resume()
-    }
-
-    private func checkSenderTimeout() {
-        guard hasActiveSender, let lastPacketAt else {
-            return
-        }
-        guard Date().timeIntervalSince(lastPacketAt) > 1.5 else {
-            return
-        }
-        hasActiveSender = false
-        activeConnectionId = nil
-        self.lastPacketAt = nil
-        onStatusChanged?("Waiting for iPhone")
+        self.browser = browser
+        browser.start(queue: queue)
     }
 }
 
@@ -263,10 +303,13 @@ final class USBMuxReceiver: @unchecked Sendable {
     }
 
     func sendControlCommand(_ command: CameraControlPayload) {
+        guard let payload = try? JSONEncoder().encode(command) else { return }
+        send(CameraPacket(kind: .control, streamId: CameraProtocol.streamId, payload: payload))
+    }
+
+    func send(_ packet: CameraPacket) {
         queue.async { [weak self] in
             guard let self, self.streamFd >= 0 else { return }
-            guard let payload = try? JSONEncoder().encode(command) else { return }
-            let packet = CameraPacket(kind: .control, streamId: CameraProtocol.streamId, payload: payload)
             let framed = packet.framedForTCP()
             framed.withUnsafeBytes { raw in
                 _ = Darwin.send(self.streamFd, raw.baseAddress!, raw.count, 0)
@@ -302,7 +345,7 @@ final class USBMuxReceiver: @unchecked Sendable {
             if err == EPERM || err == EACCES {
                 if !isSandboxRestricted {
                     isSandboxRestricted = true
-                    print("[USBMux] /var/run/usbmuxd is unavailable under macOS App Sandbox. Direct USB cable streaming will operate via peer-to-peer USB Ethernet.")
+                    print("[USBMux] /var/run/usbmuxd is unavailable under the macOS App Sandbox; connect over Wi-Fi instead.")
                 }
             }
             return nil
@@ -468,7 +511,7 @@ final class USBMuxReceiver: @unchecked Sendable {
             return
         }
 
-        let portInt = Int(UInt16(CameraProtocol.usbMuxPort).bigEndian)
+        let portInt = Int(CameraProtocol.streamPort.bigEndian)
         let connectMsg: [String: Any] = [
             "MessageType": "Connect",
             "ClientVersionString": "iPhoneCam",
@@ -503,6 +546,7 @@ final class USBMuxReceiver: @unchecked Sendable {
         self.onConnectedChanged?(true)
         let displayName = self.attachedDevices[devID]?.deviceName ?? "iPhone"
         self.onStatusChanged?("Connected to \(displayName) via USB Cable")
+        sendControlCommand(ReceiverIdentity.identify(transport: CameraProtocol.transportUSB))
 
         DispatchQueue.global(qos: .userInteractive).async { [weak self] in
             self?.readStreamLoop(cfd, devID: devID)
@@ -522,6 +566,12 @@ final class USBMuxReceiver: @unchecked Sendable {
             queue.async { [weak self] in
                 guard let self, self.streamFd == fd else { return }
                 self.framer.append(chunk)
+                defer {
+                    if self.framer.isDesynced {
+                        // Out of sync; the read loop sees the shutdown, closes and redials.
+                        shutdown(fd, SHUT_RDWR)
+                    }
+                }
                 while let packet = self.framer.nextPacket() {
                     if packet.kind == .hello, let hello = try? JSONDecoder().decode(HelloPayload.self, from: packet.payload) {
                         self.attachedDevices[devID]?.deviceName = hello.deviceName

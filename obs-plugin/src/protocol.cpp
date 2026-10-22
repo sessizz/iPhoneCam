@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdio>
 #include <cstring>
 
 namespace iphonecam {
@@ -146,6 +147,8 @@ const char *controlActionName(ControlAction action)
         return "resetZoom";
     case ControlAction::RequestKeyFrame:
         return "requestKeyFrame";
+    case ControlAction::Identify:
+        return "identify";
     }
     return "stopZoom";
 }
@@ -163,6 +166,39 @@ const char *controlSpeedName(ControlSpeed speed)
     return "medium";
 }
 
+void appendJsonString(std::string &out, const std::string &value)
+{
+    out.push_back('"');
+    for (const unsigned char c : value) {
+        switch (c) {
+        case '"':
+            out += "\\\"";
+            break;
+        case '\\':
+            out += "\\\\";
+            break;
+        case '\n':
+            out += "\\n";
+            break;
+        case '\r':
+            out += "\\r";
+            break;
+        case '\t':
+            out += "\\t";
+            break;
+        default:
+            if (c < 0x20) {
+                char escaped[8];
+                std::snprintf(escaped, sizeof(escaped), "\\u%04x", c);
+                out += escaped;
+            } else {
+                out.push_back(char(c));
+            }
+        }
+    }
+    out.push_back('"');
+}
+
 } // namespace
 
 std::optional<CameraPacket> parsePacket(const uint8_t *data, size_t size)
@@ -173,7 +209,7 @@ std::optional<CameraPacket> parsePacket(const uint8_t *data, size_t size)
         return std::nullopt;
 
     const auto rawKind = data[5];
-    if (rawKind < uint8_t(PacketKind::Hello) || rawKind > uint8_t(PacketKind::Audio))
+    if (rawKind < uint8_t(PacketKind::Hello) || rawKind > uint8_t(PacketKind::TimeSyncResponse))
         return std::nullopt;
 
     const uint32_t payloadLength = readU32BE(data + 32);
@@ -217,6 +253,12 @@ std::vector<uint8_t> encodeControlPayload(const ControlCommand &command)
         json += ",\"speed\":\"";
         json += controlSpeedName(command.speed);
         json += "\"";
+    }
+    if (command.action == ControlAction::Identify) {
+        json += ",\"transport\":";
+        appendJsonString(json, command.transport);
+        json += ",\"clientName\":";
+        appendJsonString(json, command.clientName);
     }
     json += "}";
     return std::vector<uint8_t>(json.begin(), json.end());

@@ -1,5 +1,4 @@
 import Combine
-import Network
 import SwiftUI
 import UIKit
 
@@ -150,6 +149,15 @@ struct ContentView: View {
                 .accessibilityLabel("Reconnect")
             }
 
+            if model.receiverCount == 0 {
+                Text(model.connectHint)
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.cyan)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.7)
+                    .padding(.top, isInfoExpanded ? 0 : 6)
+            }
+
             if isInfoExpanded {
                 ScrollView(.vertical) {
                     VStack(alignment: .leading, spacing: 6) {
@@ -182,6 +190,8 @@ struct ContentView: View {
                         Divider()
                             .overlay(.white.opacity(0.18))
                         Text(model.networkStatus)
+                        Text(model.connectHint)
+                            .foregroundStyle(.cyan)
                         HStack(spacing: 4) {
                             Text("Interface: \(model.activeInterface)")
                                 .foregroundStyle(model.isUSBActive ? .green : .white)
@@ -195,6 +205,13 @@ struct ContentView: View {
                             .overlay(.white.opacity(0.18))
                         Text("Video Codec: \(model.activeCodec.rawValue)")
                         codecPicker
+                        Text("Stream Quality: \(model.streamQuality.label)")
+                        qualityPicker
+                        Text(model.streamQuality == .maximum
+                             ? "Probes above the target while the link is clean (most headroom over USB)."
+                             : "Holds the codec target and only backs off when the link struggles.")
+                            .font(.caption2)
+                            .foregroundStyle(.white.opacity(0.65))
                         Divider()
                             .overlay(.white.opacity(0.18))
                         HStack(alignment: .center) {
@@ -291,6 +308,19 @@ struct ContentView: View {
         )) {
             Text("HEVC (H.265)").tag(VideoCodecType.hevc)
             Text("H.264").tag(VideoCodecType.h264)
+        }
+        .pickerStyle(.segmented)
+        .labelsHidden()
+    }
+
+    private var qualityPicker: some View {
+        Picker("Stream Quality", selection: Binding(
+            get: { model.streamQuality },
+            set: { model.setStreamQuality($0) }
+        )) {
+            ForEach(StreamQuality.allCases) { quality in
+                Text(quality.label).tag(quality)
+            }
         }
         .pickerStyle(.segmented)
         .labelsHidden()
@@ -626,9 +656,10 @@ final class CameraViewModel: ObservableObject {
         static let videoCodec = "camera.videoCodec"
         static let audioProfile = "camera.audioProfile"
         static let isAudioMuted = "camera.isAudioMuted"
+        static let streamQuality = "stream.quality"
     }
 
-    @Published var networkStatus = "Looking for Mac receiver..."
+    @Published var networkStatus = "Starting listener..."
     @Published var senderStats = "0 frames sent"
     @Published var remoteControlStatus = "OBS control: idle"
     @Published var bleJoystickStatus = "BLE joystick: idle"
@@ -643,16 +674,25 @@ final class CameraViewModel: ObservableObject {
     @Published var activeInterface = "Detecting..."
     @Published var isUSBActive = false
     @Published var cameraName: String = DeviceIdentity.displayName
+    @Published var streamQuality: StreamQuality = .balanced
+    @Published var connectAddresses: [String] = []
+    @Published var receiverCount = 0
+
+    /// What to type into OBS or the Mac app: the phone's IP (Bonjour name lookup also works on the same network).
+    var connectHint: String {
+        guard let address = connectAddresses.first else {
+            return "No Wi-Fi address; connect with a USB cable"
+        }
+        return "Connect OBS/Mac to \(address) (port \(CameraProtocol.streamPort))"
+    }
 
     let capture = CameraCaptureController()
     let previewRenderer = CameraPreviewRenderer()
     let zoomPresets: [CGFloat] = [0.5, 1, 2, 4, 8]
 
-    private let browser = BonjourBrowser()
     private let sender = NetworkVideoSender()
     private let bleJoystick = BLEJoystickController()
     private var started = false
-    private var lastEndpoint: NWEndpoint?
     private var idleTimerWasDisabled = false
     private var idleTimerManaged = false
     private var cancellables = Set<AnyCancellable>()
@@ -728,6 +768,24 @@ final class CameraViewModel: ObservableObject {
         sender.onRequestKeyFrame = { [weak self] in
             self?.capture.requestKeyFrame()
         }
+        let capture = capture
+        sender.onBitrateChanged = { bitsPerSecond in
+            capture.setBitrate(bitsPerSecond)
+        }
+        sender.onAddressesChanged = { [weak self] addresses in
+            Task { @MainActor in
+                self?.connectAddresses = addresses
+            }
+        }
+        sender.onReceiverCountChanged = { [weak self] count in
+            Task { @MainActor in
+                self?.receiverCount = count
+            }
+        }
+        let sender = sender
+        capture.onPressureScaleChanged = { scale in
+            sender.setPressureScale(scale)
+        }
         bleJoystick.onReport = { [weak self] report in
             Task { @MainActor in
                 self?.handleBLEJoystickReport(report)
@@ -737,15 +795,6 @@ final class CameraViewModel: ObservableObject {
             Task { @MainActor in
                 self?.stopBLEZoomInput()
             }
-        }
-        browser.onStatusChanged = { [weak self] status in
-            Task { @MainActor in
-                self?.networkStatus = status
-            }
-        }
-        browser.onEndpointFound = { [weak self] endpoint in
-            self?.lastEndpoint = endpoint
-            self?.sender.connect(to: endpoint)
         }
         capture.onFormat = { [weak self] format in
             self?.sender.updateFormat(format)
@@ -761,9 +810,7 @@ final class CameraViewModel: ObservableObject {
         }
 
         sender.updateDeviceName(cameraName)
-        browser.myDeviceName = cameraName
-        sender.startUSBServer()
-        browser.start()
+        sender.start()
         capture.start()
         bleJoystick.start()
         updateOrientation()
@@ -772,9 +819,7 @@ final class CameraViewModel: ObservableObject {
     func stop() {
         stopBLEZoomInput()
         bleJoystick.stop()
-        browser.stop()
         sender.stop()
-        sender.stopUSBServer()
         capture.stop()
         started = false
         restoreIdleTimer()
@@ -871,7 +916,6 @@ final class CameraViewModel: ObservableObject {
         DeviceIdentity.customName = trimmed
         cameraName = trimmed
         sender.updateDeviceName(trimmed)
-        browser.myDeviceName = trimmed
     }
 
     func resetCameraName() {
@@ -879,7 +923,6 @@ final class CameraViewModel: ObservableObject {
         let fallback = DeviceIdentity.displayName
         cameraName = fallback
         sender.updateDeviceName(fallback)
-        browser.myDeviceName = fallback
     }
 
     func reconnect() {
@@ -887,7 +930,6 @@ final class CameraViewModel: ObservableObject {
         senderStats = "0 frames sent"
         remoteControlStatus = "OBS control: idle"
         bleControlStatus = "BLE zoom: idle"
-        lastEndpoint = nil
         stop()
         Task { @MainActor [weak self] in
             try? await Task.sleep(nanoseconds: 350_000_000)
@@ -973,6 +1015,22 @@ final class CameraViewModel: ObservableObject {
         if defaults.object(forKey: SettingsKey.isAudioMuted) != nil {
             capture.setAudioMuted(defaults.bool(forKey: SettingsKey.isAudioMuted))
         }
+
+        if
+            let rawQuality = defaults.string(forKey: SettingsKey.streamQuality),
+            let quality = StreamQuality(rawValue: rawQuality)
+        {
+            streamQuality = quality
+        }
+        capture.setQuality(streamQuality)
+        sender.setQuality(streamQuality)
+    }
+
+    func setStreamQuality(_ quality: StreamQuality) {
+        streamQuality = quality
+        UserDefaults.standard.set(quality.rawValue, forKey: SettingsKey.streamQuality)
+        capture.setQuality(quality)
+        sender.setQuality(quality)
     }
 
     func setCodec(_ codec: VideoCodecType) {
@@ -1098,6 +1156,9 @@ final class CameraViewModel: ObservableObject {
             capture.rampZoom(to: 1, duration: presetRampDuration)
         case .requestKeyFrame:
             capture.requestKeyFrame()
+        case .identify:
+            // The sender consumes identify itself.
+            break
         }
     }
 

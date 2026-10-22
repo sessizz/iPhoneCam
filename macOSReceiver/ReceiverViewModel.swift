@@ -1,6 +1,40 @@
 import AVFoundation
 import Foundation
 
+/// Where the receiver gets its stream from.
+enum ReceiverSource: Hashable, Sendable {
+    /// USB when a cable is attached, otherwise the first iPhone found on the network.
+    case auto
+    case usb
+    case phone(String)
+    case address(String)
+
+    var storageValue: String {
+        switch self {
+        case .auto:
+            return "auto"
+        case .usb:
+            return "usb"
+        case .phone(let name):
+            return "phone:" + name
+        case .address(let address):
+            return "address:" + address
+        }
+    }
+
+    init(storageValue: String) {
+        if storageValue == "usb" {
+            self = .usb
+        } else if storageValue.hasPrefix("phone:") {
+            self = .phone(String(storageValue.dropFirst("phone:".count)))
+        } else if storageValue.hasPrefix("address:") {
+            self = .address(String(storageValue.dropFirst("address:".count)))
+        } else {
+            self = .auto
+        }
+    }
+}
+
 // MARK: - StreamReceiverEngine (Dedicated Background Pipeline)
 final class StreamReceiverEngine: @unchecked Sendable {
     var onStatusChanged: ((String) -> Void)?
@@ -9,21 +43,24 @@ final class StreamReceiverEngine: @unchecked Sendable {
     var onWaitingForKeyFrameChanged: ((Bool) -> Void)?
     var onConnectionModeChanged: ((_ isConnected: Bool, _ isUSB: Bool) -> Void)?
     var onCodecChanged: ((String) -> Void)?
-    var onDiscoveredDevicesChanged: (([String]) -> Void)?
+    var onPhonesChanged: (([String]) -> Void)?
 
     let renderer = VideoRenderer()
 
-    private let receiver = UDPReceiver()
+    private let phoneConnection = PhoneConnection()
+    private let browser = PhoneBrowser()
     private let usbReceiver = USBMuxReceiver()
     private let packetProcessor = ReceiverPacketProcessor()
     private let renderQueue = DispatchQueue(label: "iphonecam.receiver.render", qos: .userInteractive)
-    private var isUSBMuxConnected = false
-    private var isWiredNetwork = false
-    private var isUSBMode: Bool { isUSBMuxConnected || isWiredNetwork }
-    private var targetDeviceName = "Auto"
-    private var discoveredDeviceNames = Set<String>()
 
     // State accessed exclusively on renderQueue:
+    private var source: ReceiverSource = .auto
+    private var discoveredPhones: [String] = []
+    /// Auto mode sticks with the phone it picked while that phone stays visible.
+    private var autoPhone: String?
+    private var isUSBMuxConnected = false
+    private var isPhoneConnected = false
+    private var usesUSB: Bool { source == .usb || source == .auto }
     private var sampleBuilder: H264SampleBuilder?
     private var isWaitingForKeyFrame = true
     private var displayedFrames = 0
@@ -35,13 +72,56 @@ final class StreamReceiverEngine: @unchecked Sendable {
     private var lastFrameReceivedAt = Date.distantPast
     private var idleCheckTimer: DispatchSourceTimer?
     private var framesSinceStats = 0
+    private var clock = ClockOffsetEstimator()
+    /// Capture on the iPhone to the frame being queued for display, smoothed; nil until the clock is synced.
+    private var latencyMs: Double?
     private var started = false
 
     func sendControlCommand(_ command: CameraControlPayload) {
-        if isUSBMuxConnected {
+        renderQueue.async { [weak self] in
+            self?.sendControlCommandOnQueue(command)
+        }
+    }
+
+    private func sendControlCommandOnQueue(_ command: CameraControlPayload) {
+        if isUSBMuxConnected && usesUSB {
             usbReceiver.sendControlCommand(command)
         } else {
-            receiver.sendControlCommand(command)
+            phoneConnection.send(command)
+        }
+    }
+
+    private static func monotonicNanos() -> UInt64 {
+        DispatchTime.now().uptimeNanoseconds
+    }
+
+    private func sendTimeSyncRequest() {
+        let request = CameraPacket(kind: .timeSyncRequest, streamId: CameraProtocol.streamId, ptsNanos: Self.monotonicNanos(), payload: Data())
+        if isUSBMuxConnected && usesUSB {
+            usbReceiver.send(request)
+        } else if isPhoneConnected {
+            phoneConnection.send(request)
+        }
+    }
+
+    private func handleTimeSyncResponse(_ packet: CameraPacket) {
+        guard let sentAt = ClockOffsetEstimator.echoedClock(in: packet.payload) else { return }
+        clock.addSample(localSendNanos: sentAt, phoneNanos: packet.ptsNanos, localReceiveNanos: Self.monotonicNanos())
+    }
+
+    private func noteFrameLatency(_ frame: EncodedVideoFrame) {
+        let now = Self.monotonicNanos()
+        guard let capturedAt = clock.localNanos(forPhoneNanos: frame.ptsNanos), capturedAt <= now else { return }
+        let sample = Double(now - capturedAt) / 1_000_000
+        latencyMs = latencyMs.map { $0 * 0.9 + sample * 0.1 } ?? sample
+    }
+
+    /// Time-sync packets are answered here; everything else is the stream.
+    private func acceptOnQueue(_ packet: CameraPacket) {
+        if packet.kind == .timeSyncResponse {
+            handleTimeSyncResponse(packet)
+        } else {
+            packetProcessor.accept(packet)
         }
     }
 
@@ -49,21 +129,63 @@ final class StreamReceiverEngine: @unchecked Sendable {
         let now = Date()
         guard now.timeIntervalSince(lastKeyFrameRequestDate) > 0.5 else { return }
         lastKeyFrameRequestDate = now
-        let cmd = CameraControlPayload(action: .requestKeyFrame)
-        sendControlCommand(cmd)
+        sendControlCommandOnQueue(CameraControlPayload(action: .requestKeyFrame))
     }
 
-    func setTargetDevice(_ name: String) {
+    func setSource(_ source: ReceiverSource) {
         renderQueue.async { [weak self] in
-            guard let self else { return }
-            self.targetDeviceName = name
-            self.usbReceiver.setTargetDevice(name)
-            self.receiver.setTargetDevice(name)
-            self.packetProcessor.reset()
-            self.lastEnqueuedFrameId = 0
-            self.isWaitingForKeyFrame = true
-            self.onWaitingForKeyFrameChanged?(true)
+            guard let self, self.source != source else { return }
+            self.source = source
+            self.autoPhone = nil
+            self.resetStreamState()
+            self.applySource()
         }
+    }
+
+    /// Starts or stops the transports so exactly one of them carries the stream.
+    private func applySource() {
+        guard started else { return }
+        switch source {
+        case .usb:
+            phoneConnection.disconnect()
+            usbReceiver.start()
+            if !isUSBMuxConnected {
+                onStatusChanged?("Waiting for an iPhone on USB (open iPhoneCam on the phone)")
+            }
+        case .auto:
+            usbReceiver.start()
+            if isUSBMuxConnected {
+                phoneConnection.disconnect()
+                return
+            }
+            if autoPhone == nil || !discoveredPhones.contains(autoPhone!) {
+                autoPhone = discoveredPhones.first
+            }
+            if let autoPhone {
+                phoneConnection.connect(to: .service(autoPhone))
+            } else {
+                phoneConnection.disconnect()
+                onStatusChanged?("Looking for iPhones running iPhoneCam...")
+            }
+        case .phone(let name):
+            usbReceiver.stop()
+            isUSBMuxConnected = false
+            phoneConnection.connect(to: .service(name))
+        case .address(let address):
+            usbReceiver.stop()
+            isUSBMuxConnected = false
+            phoneConnection.connect(to: .address(address))
+        }
+    }
+
+    private func resetStreamState() {
+        // A new link may reach another iPhone or a restarted app; measure the clock afresh.
+        clock.reset()
+        latencyMs = nil
+        packetProcessor.reset()
+        lastEnqueuedFrameId = 0
+        isWaitingForKeyFrame = true
+        onWaitingForKeyFrameChanged?(true)
     }
 
     func start() {
@@ -72,70 +194,62 @@ final class StreamReceiverEngine: @unchecked Sendable {
             self.started = true
             self.startIdleTimerIfNeeded()
 
-            self.usbReceiver.onDiscoveredDevicesChanged = { [weak self] devices in
-                self?.renderQueue.async {
+            self.browser.onPhonesChanged = { [weak self] phones in
+                self?.renderQueue.async { [weak self] in
                     guard let self else { return }
-                    for d in devices { self.discoveredDeviceNames.insert(d) }
-                    self.onDiscoveredDevicesChanged?(Array(self.discoveredDeviceNames).sorted())
-                }
-            }
-
-            self.usbReceiver.onStatusChanged = { [weak self] status in
-                self?.renderQueue.async {
-                    self?.onStatusChanged?(status)
-                }
-            }
-            self.usbReceiver.onConnectedChanged = { [weak self] connected in
-                self?.renderQueue.async {
-                    guard let self else { return }
-                    let wasConnected = self.isUSBMuxConnected
-                    self.isUSBMuxConnected = connected
-                    self.lastEnqueuedFrameId = 0
-                    if connected {
-                        self.packetProcessor.reset()
-                        self.isWaitingForKeyFrame = true
-                        self.onWaitingForKeyFrameChanged?(true)
-                        self.onConnectionModeChanged?(true, self.isUSBMode)
-                        self.onStatusChanged?("Connected via USB Cable (High-Speed)")
-                        self.requestKeyFrameFromSender()
-                    } else if wasConnected {
-                        self.packetProcessor.reset()
-                        self.isWaitingForKeyFrame = true
-                        self.onWaitingForKeyFrameChanged?(true)
-                        self.onConnectionModeChanged?(true, self.isUSBMode)
-                        self.onStatusChanged?("USB Disconnected - Switched to Wi-Fi")
-                        self.requestKeyFrameFromSender()
+                    self.discoveredPhones = phones
+                    self.onPhonesChanged?(phones)
+                    if self.source == .auto {
+                        self.applySource()
                     }
                 }
             }
-            self.usbReceiver.onPacket = { [weak self] packet in
-                self?.renderQueue.async {
-                    guard let self, self.isUSBMuxConnected else { return }
-                    self.packetProcessor.accept(packet)
-                }
-            }
-            self.usbReceiver.start()
-
-            self.receiver.onStatusChanged = { [weak self] status in
-                self?.renderQueue.async {
-                    guard let self, !self.isUSBMuxConnected else { return }
+            self.usbReceiver.onStatusChanged = { [weak self] status in
+                self?.renderQueue.async { [weak self] in
+                    guard let self, self.usesUSB, self.isUSBMuxConnected || self.source == .usb else { return }
                     self.onStatusChanged?(status)
                 }
             }
-            self.receiver.onInterfaceChanged = { [weak self] interfaceDesc, isWired in
-                self?.renderQueue.async {
+            self.usbReceiver.onConnectedChanged = { [weak self] connected in
+                self?.renderQueue.async { [weak self] in
                     guard let self else { return }
-                    self.isWiredNetwork = isWired
-                    if !self.isUSBMuxConnected {
-                        self.onConnectionModeChanged?(true, isWired)
-                        self.onStatusChanged?("Connected: \(interfaceDesc)")
+                    let wasConnected = self.isUSBMuxConnected
+                    self.isUSBMuxConnected = connected
+                    guard self.usesUSB, connected != wasConnected else { return }
+                    self.resetStreamState()
+                    if connected {
+                        self.onConnectionModeChanged?(true, true)
+                        self.onStatusChanged?("Connected via USB cable")
+                        self.requestKeyFrameFromSender()
+                    } else {
+                        self.onConnectionModeChanged?(false, false)
+                        self.onStatusChanged?("USB disconnected")
                     }
+                    // Auto mode moves between the cable and the network as the cable comes and goes.
+                    self.applySource()
                 }
             }
-            self.receiver.onPacket = { [weak self] packet in
-                self?.renderQueue.async {
-                    guard let self, !self.isUSBMuxConnected else { return }
-                    self.packetProcessor.accept(packet)
+            self.usbReceiver.onPacket = { [weak self] packet in
+                self?.renderQueue.async { [weak self] in
+                    guard let self, self.isUSBMuxConnected, self.usesUSB else { return }
+                    self.acceptOnQueue(packet)
+                }
+            }
+            self.phoneConnection.onStateChanged = { [weak self] connected, status in
+                self?.renderQueue.async { [weak self] in
+                    guard let self, !(self.usesUSB && self.isUSBMuxConnected) else { return }
+                    if connected != self.isPhoneConnected {
+                        self.isPhoneConnected = connected
+                        self.resetStreamState()
+                    }
+                    self.onConnectionModeChanged?(connected, false)
+                    self.onStatusChanged?(status)
+                }
+            }
+            self.phoneConnection.onPacket = { [weak self] packet in
+                self?.renderQueue.async { [weak self] in
+                    guard let self, !(self.usesUSB && self.isUSBMuxConnected) else { return }
+                    self.acceptOnQueue(packet)
                 }
             }
             self.packetProcessor.onHello = { [weak self] hello in
@@ -148,13 +262,15 @@ final class StreamReceiverEngine: @unchecked Sendable {
                 self?.handleFrameOnQueue(frame, droppedFrames: droppedCount)
             }
 
-            self.receiver.start()
+            self.browser.start()
+            self.applySource()
         }
     }
 
     func stop() {
-        receiver.stop()
+        phoneConnection.disconnect()
         usbReceiver.stop()
+        browser.stop()
         renderQueue.async { [weak self] in
             guard let self else { return }
             self.packetProcessor.reset()
@@ -162,6 +278,8 @@ final class StreamReceiverEngine: @unchecked Sendable {
             self.stopIdleTimer()
             self.sampleBuilder = nil
             self.isWaitingForKeyFrame = true
+            self.isUSBMuxConnected = false
+            self.isPhoneConnected = false
             self.displayedFrames = 0
             self.droppedFrames = 0
             self.displayDroppedFrames = 0
@@ -173,13 +291,7 @@ final class StreamReceiverEngine: @unchecked Sendable {
     }
 
     private func handleHelloOnQueue(_ hello: HelloPayload) {
-        discoveredDeviceNames.insert(hello.deviceName)
-        onDiscoveredDevicesChanged?(Array(discoveredDeviceNames).sorted())
-
-        if targetDeviceName != "Auto" && !targetDeviceName.isEmpty && hello.deviceName != targetDeviceName {
-            return
-        }
-
+        let isUSBMode = isUSBMuxConnected && usesUSB
         let codecLabel = hello.codec == CameraProtocol.codecHEVCHVCC ? "HEVC" : "H.264"
         onCodecChanged?(codecLabel)
         let mode = isUSBMode ? "USB (Cable)" : "Wi-Fi"
@@ -198,7 +310,7 @@ final class StreamReceiverEngine: @unchecked Sendable {
 
             let codecLabel = format.codec == CameraProtocol.codecHEVCHVCC ? "HEVC" : "H.264"
             onCodecChanged?(codecLabel)
-            onConnectionModeChanged?(true, isUSBMode)
+            onConnectionModeChanged?(true, isUSBMuxConnected && usesUSB)
             let text = "\(format.width)x\(format.height) @ \(format.fps) FPS (\(codecLabel)), \(format.bitrate / 1_000_000) Mbps"
             onFormatChanged?(text)
             onWaitingForKeyFrameChanged?(true)
@@ -234,7 +346,7 @@ final class StreamReceiverEngine: @unchecked Sendable {
             onWaitingForKeyFrameChanged?(false)
         }
 
-        onConnectionModeChanged?(true, isUSBMode)
+        onConnectionModeChanged?(true, isUSBMuxConnected && usesUSB)
         guard let sampleBuilder else {
             isWaitingForKeyFrame = true
             requestKeyFrameFromSender()
@@ -244,6 +356,7 @@ final class StreamReceiverEngine: @unchecked Sendable {
         do {
             let sampleBuffer = try sampleBuilder.makeSampleBuffer(from: frame)
             if renderer.enqueue(sampleBuffer) {
+                noteFrameLatency(frame)
                 lastEnqueuedFrameId = frame.frameId
                 displayedFrames += 1
                 framesSinceStats += 1
@@ -267,6 +380,7 @@ final class StreamReceiverEngine: @unchecked Sendable {
         timer.schedule(deadline: .now() + 1.0, repeating: .seconds(1))
         timer.setEventHandler { [weak self] in
             guard let self else { return }
+            self.sendTimeSyncRequest()
             if self.lastFrameReceivedAt != .distantPast && Date().timeIntervalSince(self.lastFrameReceivedAt) > 2.0 {
                 self.onConnectionModeChanged?(false, false)
                 self.onStatusChanged?("Waiting for iPhone")
@@ -295,13 +409,18 @@ final class StreamReceiverEngine: @unchecked Sendable {
         framesSinceStats = 0
         lastStatsDate = now
 
-        let text = String(
+        var text = String(
             format: "%d frames, %.1f FPS, %d net drop, %d disp drop",
             displayed,
             fps,
             dropped,
             displayDropped
         )
+        if let latencyMs, let roundTrip = clock.roundTripNanos {
+            text += String(format: "\nLatency %.0f ms (capture to display queue), clock RTT %.1f ms", latencyMs, Double(roundTrip) / 1_000_000)
+        } else {
+            text += "\nLatency: measuring..."
+        }
         onStatsChanged?(text)
     }
 }
@@ -309,6 +428,11 @@ final class StreamReceiverEngine: @unchecked Sendable {
 // MARK: - ReceiverViewModel (UI-facing @MainActor)
 @MainActor
 final class ReceiverViewModel: ObservableObject {
+    private enum SettingsKey {
+        static let source = "receiver.source"
+        static let manualAddress = "receiver.manualAddress"
+    }
+
     @Published var statusText = "Waiting for iPhone"
     @Published var formatText = "No stream"
     @Published var statsText = "0 frames, 0 dropped"
@@ -316,17 +440,32 @@ final class ReceiverViewModel: ObservableObject {
     @Published var isUSBActive = false
     @Published var isConnected = false
     @Published var activeCodec = "HEVC"
-    @Published var availableDevices: [String] = ["Auto"]
-    @Published var selectedDevice: String = "Auto"
+    @Published var phones: [String] = []
+    @Published private(set) var selectedSource: ReceiverSource
+    @Published var manualAddress: String
 
     var renderer: VideoRenderer { engine.renderer }
 
     private let engine = StreamReceiverEngine()
     private var started = false
 
-    func selectDevice(_ device: String) {
-        selectedDevice = device
-        engine.setTargetDevice(device)
+    init() {
+        let defaults = UserDefaults.standard
+        selectedSource = ReceiverSource(storageValue: defaults.string(forKey: SettingsKey.source) ?? "auto")
+        manualAddress = defaults.string(forKey: SettingsKey.manualAddress) ?? ""
+    }
+
+    func selectSource(_ source: ReceiverSource) {
+        selectedSource = source
+        UserDefaults.standard.set(source.storageValue, forKey: SettingsKey.source)
+        engine.setSource(source)
+    }
+
+    func connectToManualAddress() {
+        let address = manualAddress.trimmingCharacters(in: .whitespaces)
+        guard !address.isEmpty else { return }
+        UserDefaults.standard.set(address, forKey: SettingsKey.manualAddress)
+        selectSource(.address(address))
     }
 
     func start() {
@@ -364,17 +503,13 @@ final class ReceiverViewModel: ObservableObject {
                 self?.activeCodec = codec
             }
         }
-        engine.onDiscoveredDevicesChanged = { [weak self] devices in
+        engine.onPhonesChanged = { [weak self] phones in
             Task { @MainActor in
-                guard let self else { return }
-                var list = ["Auto"]
-                for d in devices where !list.contains(d) {
-                    list.append(d)
-                }
-                self.availableDevices = list
+                self?.phones = phones
             }
         }
 
+        engine.setSource(selectedSource)
         engine.start()
     }
 

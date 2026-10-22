@@ -7,18 +7,23 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstring>
 #include <vector>
 
 namespace iphonecam {
 namespace {
 
-constexpr const char *kSettingReceiverName = "receiver_name";
+constexpr const char *kSettingConnectionMode = "connection_mode";
+constexpr const char *kSettingHost = "host";
 constexpr const char *kSettingTargetDevice = "target_device";
 constexpr const char *kSettingLatency = "latency_ms";
 constexpr const char *kSettingAudioEnabled = "audio_enabled";
 constexpr const char *kSettingAudioOffset = "audio_offset_ms";
 constexpr uint64_t kOneSecondNanos = 1000000000ULL;
 constexpr auto kKeyFrameRequestInterval = std::chrono::milliseconds(250);
+constexpr auto kTimeSyncInterval = std::chrono::seconds(1);
+constexpr const char *kModeUsb = "usb";
+constexpr const char *kModeWiFi = "wifi";
 
 const char *packetKindName(PacketKind kind)
 {
@@ -33,19 +38,36 @@ const char *packetKindName(PacketKind kind)
         return "control";
     case PacketKind::Audio:
         return "audio";
+    case PacketKind::Ping:
+        return "ping";
+    case PacketKind::TimeSyncRequest:
+        return "timesync-request";
+    case PacketKind::TimeSyncResponse:
+        return "timesync-response";
     }
     return "unknown";
 }
 
+std::string formatMilliseconds(double value)
+{
+    if (value < 0)
+        return "measuring...";
+    char buffer[32];
+    std::snprintf(buffer, sizeof(buffer), "%.0f ms", value);
+    return buffer;
+}
+
 std::string formatStats(const SourceStats &stats)
 {
-    char buffer[768];
+    char buffer[1024];
     std::snprintf(buffer, sizeof(buffer),
                   "Status: %s\n"
                   "Target: %s\n"
                   "Device: %s\n"
                   "Format: %s\n"
-                  "UDP Port: %s\n"
+                  "Connection: %s\n"
+                  "Latency (capture to decode): %s\n"
+                  "Clock round trip: %s\n"
                   "Received FPS: %.1f\n"
                   "Displayed FPS: %.1f\n"
                   "Received Frames: %d\n"
@@ -56,7 +78,8 @@ std::string formatStats(const SourceStats &stats)
                   "Waiting For Keyframe: %s\n"
                   "No Signal: black after 1s",
                   stats.status.c_str(), stats.targetDevice.c_str(), stats.deviceName.c_str(),
-                  stats.format.c_str(), stats.udpPort.c_str(),
+                  stats.format.c_str(), stats.connection.c_str(), formatMilliseconds(stats.latencyMs).c_str(),
+                  formatMilliseconds(stats.clockRttMs).c_str(),
                   stats.receivedFps, stats.displayedFps, stats.receivedFrames, stats.displayedFrames,
                   stats.networkDroppedFrames, stats.decodeDroppedFrames, stats.keyFrameRequests,
                   stats.waitingForKeyFrame ? "yes" : "no");
@@ -66,9 +89,11 @@ std::string formatStats(const SourceStats &stats)
 SourceSettings readSettings(obs_data_t *settings)
 {
     SourceSettings result;
-    const char *receiverName = obs_data_get_string(settings, kSettingReceiverName);
-    if (receiverName && *receiverName)
-        result.receiverName = receiverName;
+    const char *mode = obs_data_get_string(settings, kSettingConnectionMode);
+    result.mode = (mode && std::strcmp(mode, kModeWiFi) == 0) ? ConnectionMode::WiFi : ConnectionMode::Usb;
+    const char *host = obs_data_get_string(settings, kSettingHost);
+    if (host && *host)
+        result.host = host;
     const char *targetDevice = obs_data_get_string(settings, kSettingTargetDevice);
     if (targetDevice && *targetDevice)
         result.targetDevice = targetDevice;
@@ -128,15 +153,10 @@ IPhoneCamSource::IPhoneCamSource(obs_data_t *settings, obs_source_t *source)
       lastStatsAt_(std::chrono::steady_clock::now())
 {
     applyLatencyMode();
-    receiver_->setStatusCallback([this](const std::string &status, uint16_t port) {
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            stats_.status = status;
-            stats_.udpPort = port == 0 ? "-" : std::to_string(port);
-        }
-        markStatsDirty();
+    receiver_->setStatusCallback([this](const std::string &status, const std::string &connection, bool connected) {
+        handleConnectionStatus(status, connection, connected);
     });
-    receiver_->setPacketCallback([this](const std::vector<uint8_t> &data) { handleDatagram(data); });
+    receiver_->setPacketCallback([this](const std::vector<uint8_t> &data) { handlePacket(data); });
     registerHotkeys();
     startReceiver();
 }
@@ -156,7 +176,8 @@ IPhoneCamSource::~IPhoneCamSource()
 void IPhoneCamSource::update(obs_data_t *settings)
 {
     const auto next = readSettings(settings);
-    const bool restartNeeded = next.receiverName != settings_.receiverName || next.targetDevice != settings_.targetDevice;
+    const bool restartNeeded =
+        next.mode != settings_.mode || next.host != settings_.host || next.targetDevice != settings_.targetDevice;
     const bool latencyChanged = next.latencyMs != settings_.latencyMs;
     settings_ = next;
     if (latencyChanged)
@@ -171,7 +192,6 @@ void IPhoneCamSource::restart()
     {
         std::lock_guard<std::mutex> lock(mutex_);
         stats_ = SourceStats{};
-        stats_.targetDevice = settings_.targetDevice.empty() ? "Auto" : settings_.targetDevice;
         stats_.status = "Restarting receiver";
         reassembler_.reset();
         lastFormat_.reset();
@@ -185,6 +205,7 @@ void IPhoneCamSource::restart()
 void IPhoneCamSource::videoTick(float)
 {
     updateFpsCounters();
+    sendTimeSyncRequest();
     const auto now = std::chrono::steady_clock::now();
     if (now - lastFrameAt_ > std::chrono::seconds(1) && !noSignalOutput_) {
         outputBlackFrame();
@@ -210,12 +231,93 @@ SourceStats IPhoneCamSource::stats() const
 
 void IPhoneCamSource::startReceiver()
 {
-    receiver_->setTargetDevice(settings_.targetDevice);
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        stats_.targetDevice = settings_.targetDevice.empty() ? "Auto" : settings_.targetDevice;
+        if (settings_.mode == ConnectionMode::WiFi)
+            stats_.targetDevice = settings_.host.empty() ? "Wi-Fi (no address)" : "Wi-Fi: " + settings_.host;
+        else
+            stats_.targetDevice = settings_.targetDevice.empty() ? "USB (first iPhone)" : "USB: " + settings_.targetDevice;
     }
-    receiver_->start(settings_.receiverName);
+    ReceiverConfig config;
+    config.mode = settings_.mode;
+    config.host = settings_.host;
+    config.targetDevice = settings_.targetDevice;
+    receiver_->start(config);
+}
+
+void IPhoneCamSource::handleConnectionStatus(const std::string &status, const std::string &connection, bool connected)
+{
+    const bool changed = connected_.exchange(connected) != connected;
+    if (changed) {
+        // A new link may reach a different iPhone (or the same one after a restart): measure afresh.
+        std::lock_guard<std::mutex> lock(clockMutex_);
+        clock_.reset();
+        latencyAverageMs_ = -1;
+    }
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        stats_.status = status;
+        stats_.connection = connection.empty() ? "-" : connection;
+        stats_.connected = connected;
+        if (changed) {
+            stats_.latencyMs = -1;
+            stats_.clockRttMs = -1;
+        }
+    }
+    markStatsDirty();
+}
+
+void IPhoneCamSource::sendTimeSyncRequest()
+{
+    if (!connected_.load())
+        return;
+    const auto now = std::chrono::steady_clock::now();
+    if (now - lastTimeSyncAt_ < kTimeSyncInterval)
+        return;
+    lastTimeSyncAt_ = now;
+
+    CameraPacket packet;
+    packet.kind = PacketKind::TimeSyncRequest;
+    packet.streamId = 1;
+    packet.ptsNanos = os_gettime_ns();
+    receiver_->sendPacket(packet);
+}
+
+void IPhoneCamSource::handleTimeSyncResponse(const CameraPacket &packet)
+{
+    const uint64_t receivedAt = os_gettime_ns();
+    const auto sentAt = readTimeSyncEcho(packet.payload);
+    if (!sentAt)
+        return;
+    double rttMs = -1;
+    {
+        std::lock_guard<std::mutex> lock(clockMutex_);
+        clock_.addSample(*sentAt, packet.ptsNanos, receivedAt);
+        if (clock_.ready())
+            rttMs = double(clock_.rttNs()) / 1e6;
+    }
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        stats_.clockRttMs = rttMs;
+    }
+    markStatsDirty();
+}
+
+void IPhoneCamSource::noteFrameLatency(uint64_t ptsNanos)
+{
+    const uint64_t now = os_gettime_ns();
+    double average = -1;
+    {
+        std::lock_guard<std::mutex> lock(clockMutex_);
+        const auto capturedAt = clock_.toLocal(ptsNanos);
+        if (!capturedAt || *capturedAt > now)
+            return;
+        const double latencyMs = double(now - *capturedAt) / 1e6;
+        latencyAverageMs_ = latencyAverageMs_ < 0 ? latencyMs : latencyAverageMs_ * 0.9 + latencyMs * 0.1;
+        average = latencyAverageMs_;
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    stats_.latencyMs = average;
 }
 
 void IPhoneCamSource::stopReceiver()
@@ -304,18 +406,20 @@ void IPhoneCamSource::requestKeyFrame()
     sendControlCommand(command);
 }
 
-void IPhoneCamSource::handleDatagram(const std::vector<uint8_t> &data)
+void IPhoneCamSource::handlePacket(const std::vector<uint8_t> &data)
 {
     auto packet = parsePacket(data.data(), data.size());
     if (!packet) {
         if (invalidDatagramLogs_ < 10) {
-            blog(LOG_WARNING, "[iPhoneCam] Dropped invalid UDP datagram (%zu bytes)", data.size());
+            blog(LOG_WARNING, "[iPhoneCam] Dropped invalid packet (%zu bytes)", data.size());
             invalidDatagramLogs_ += 1;
         }
         return;
     }
 
-    if (frameLogs_ < 5 || packet->kind != PacketKind::FrameFragment) {
+    const bool routine = packet->kind == PacketKind::FrameFragment || packet->kind == PacketKind::Audio ||
+                         packet->kind == PacketKind::Ping || packet->kind == PacketKind::TimeSyncResponse;
+    if (!routine || (packet->kind == PacketKind::FrameFragment && frameLogs_ < 5)) {
         blog(LOG_INFO, "[iPhoneCam] Packet kind=%s frame=%llu fragment=%u/%u payload=%zu flags=%u",
              packetKindName(packet->kind), static_cast<unsigned long long>(packet->frameId), packet->packetIndex + 1,
              packet->packetCount, packet->payload.size(), packet->flags);
@@ -367,13 +471,20 @@ void IPhoneCamSource::handleDatagram(const std::vector<uint8_t> &data)
     case PacketKind::Audio:
         handleAudio(*packet);
         break;
+    case PacketKind::TimeSyncResponse:
+        handleTimeSyncResponse(*packet);
+        break;
+    case PacketKind::Ping:
+    case PacketKind::TimeSyncRequest:
+        break;
     }
 }
 
 void IPhoneCamSource::handleHello(const HelloPayload &hello)
 {
     registerDiscoveredDevice(hello.deviceName);
-    if (!settings_.targetDevice.empty() && hello.deviceName != settings_.targetDevice) {
+    if (settings_.mode == ConnectionMode::Usb && !settings_.targetDevice.empty() &&
+        hello.deviceName != settings_.targetDevice) {
         blog(LOG_INFO, "[iPhoneCam] Ignoring stream from '%s' because target is '%s'", hello.deviceName.c_str(),
              settings_.targetDevice.c_str());
         return;
@@ -514,6 +625,7 @@ void IPhoneCamSource::decodeFrame(const EncodedVideoFrame &frame)
     }
 
     outputDecodedFrame(decoded);
+    noteFrameLatency(frame.ptsNanos);
     if (frame.isKeyFrame && droppingUntilKeyFrame_.load())
         droppingUntilKeyFrame_ = false;
     lastFrameAt_ = std::chrono::steady_clock::now();
@@ -807,7 +919,8 @@ static uint32_t iphonecam_get_height(void *data)
 
 static void iphonecam_defaults(obs_data_t *settings)
 {
-    obs_data_set_default_string(settings, "receiver_name", "iPhoneCam OBS");
+    obs_data_set_default_string(settings, "connection_mode", "usb");
+    obs_data_set_default_string(settings, "host", "");
     obs_data_set_default_string(settings, "target_device", "");
     obs_data_set_default_int(settings, "latency_ms", 0);
     obs_data_set_default_bool(settings, "audio_enabled", true);
@@ -821,16 +934,36 @@ static bool iphonecam_restart_clicked(obs_properties_t *, obs_property_t *, void
     return true;
 }
 
+static void iphonecam_fill_device_lists(obs_properties_t *props)
+{
+    if (obs_property_t *deviceList = obs_properties_get(props, "target_device")) {
+        obs_property_list_clear(deviceList);
+        obs_property_list_add_string(deviceList, "First iPhone on USB", "");
+        for (const auto &dev : iphonecam::getDiscoveredDevices())
+            obs_property_list_add_string(deviceList, dev.c_str(), dev.c_str());
+    }
+    // Picking a discovered name dials it by name, so the source keeps working when the iPhone's IP changes.
+    if (obs_property_t *hostList = obs_properties_get(props, "host")) {
+        obs_property_list_clear(hostList);
+        for (const auto &name : iphonecam::getDiscoveredPhoneNames())
+            obs_property_list_add_string(hostList, name.c_str(), name.c_str());
+    }
+}
+
 static bool iphonecam_refresh_devices_clicked(obs_properties_t *props, obs_property_t *, void *)
 {
-    obs_property_t *deviceList = obs_properties_get(props, "target_device");
-    if (!deviceList)
-        return false;
-    obs_property_list_clear(deviceList);
-    obs_property_list_add_string(deviceList, "Auto (First Available)", "");
-    for (const auto &dev : iphonecam::getDiscoveredDevices()) {
-        obs_property_list_add_string(deviceList, dev.c_str(), dev.c_str());
-    }
+    iphonecam_fill_device_lists(props);
+    return true;
+}
+
+static bool iphonecam_connection_mode_changed(obs_properties_t *props, obs_property_t *, obs_data_t *settings)
+{
+    const char *mode = obs_data_get_string(settings, "connection_mode");
+    const bool wifi = mode && std::strcmp(mode, "wifi") == 0;
+    obs_property_set_visible(obs_properties_get(props, "host"), wifi);
+    obs_property_set_visible(obs_properties_get(props, "wifi_help"), wifi);
+    obs_property_set_visible(obs_properties_get(props, "target_device"), !wifi);
+    obs_property_set_visible(obs_properties_get(props, "usb_help"), !wifi);
     return true;
 }
 
@@ -848,16 +981,28 @@ static bool iphonecam_refresh_stats_clicked(obs_properties_t *props, obs_propert
 static obs_properties_t *iphonecam_properties(void *data)
 {
     obs_properties_t *props = obs_properties_create();
-    obs_properties_add_text(props, "receiver_name", "Receiver name", OBS_TEXT_DEFAULT);
 
-    obs_property_t *deviceList = obs_properties_add_list(
-        props, "target_device", "Target iPhone", OBS_COMBO_TYPE_EDITABLE, OBS_COMBO_FORMAT_STRING);
-    obs_property_list_add_string(deviceList, "Auto (First Available)", "");
-    for (const auto &dev : iphonecam::getDiscoveredDevices()) {
-        obs_property_list_add_string(deviceList, dev.c_str(), dev.c_str());
-    }
+    obs_property_t *mode = obs_properties_add_list(props, "connection_mode", "Connection", OBS_COMBO_TYPE_LIST,
+                                                   OBS_COMBO_FORMAT_STRING);
+    obs_property_list_add_string(mode, "USB cable", "usb");
+    obs_property_list_add_string(mode, "Wi-Fi (IP address or name)", "wifi");
+    obs_property_set_modified_callback(mode, iphonecam_connection_mode_changed);
 
-    obs_properties_add_button(props, "refresh_devices", "Refresh Devices", iphonecam_refresh_devices_clicked);
+    obs_properties_add_list(props, "host", "iPhone", OBS_COMBO_TYPE_EDITABLE, OBS_COMBO_FORMAT_STRING);
+    obs_properties_add_text(props, "wifi_help",
+                            "Type the IP address the iPhoneCam app shows, or pick the iPhone by name. "
+                            "The phone must be on the same network as this Mac.",
+                            OBS_TEXT_INFO);
+
+    obs_properties_add_list(props, "target_device", "Target iPhone", OBS_COMBO_TYPE_EDITABLE,
+                            OBS_COMBO_FORMAT_STRING);
+    obs_properties_add_text(props, "usb_help",
+                            "Connect the iPhone with a cable and open iPhoneCam. Pin a camera name to keep "
+                            "several iPhones on fixed sources.",
+                            OBS_TEXT_INFO);
+
+    iphonecam_fill_device_lists(props);
+    obs_properties_add_button(props, "refresh_devices", "Refresh iPhones", iphonecam_refresh_devices_clicked);
 
     obs_property_t *latency = obs_properties_add_list(props, "latency_ms", "Latency", OBS_COMBO_TYPE_LIST,
                                                       OBS_COMBO_FORMAT_INT);
@@ -868,7 +1013,7 @@ static obs_properties_t *iphonecam_properties(void *data)
     obs_properties_add_bool(props, "audio_enabled", "Enable Audio (Stereo)");
     obs_properties_add_int_slider(props, "audio_offset_ms", "Audio Sync Offset (ms)", -500, 500, 10);
 
-    obs_properties_add_button(props, "restart_receiver", "Restart Receiver", iphonecam_restart_clicked);
+    obs_properties_add_button(props, "restart_receiver", "Reconnect", iphonecam_restart_clicked);
     obs_properties_add_button(props, "refresh_stats", "Refresh Stats", iphonecam_refresh_stats_clicked);
     obs_properties_add_text(props, "no_signal_info", "No signal: last frame is held for 1s, then black.",
                             OBS_TEXT_INFO);

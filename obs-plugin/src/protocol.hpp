@@ -13,13 +13,24 @@ enum class PacketKind : uint8_t {
     FrameFragment = 3,
     Control = 4,
     Audio = 5,
+    // Sent by the iPhone every couple of seconds so a quiet link can be told from a dead one.
+    Ping = 6,
+    // Receiver to iPhone; ptsNanos carries the receiver's monotonic clock.
+    TimeSyncRequest = 7,
+    // iPhone to receiver; ptsNanos is the iPhone's host clock (the frame timestamp clock) and the payload echoes
+    // the request's clock as 8 big-endian bytes.
+    TimeSyncResponse = 8,
 };
 
 constexpr uint32_t kPacketMagic = 0x4950434d;
 constexpr uint8_t kPacketVersion = 1;
 constexpr size_t kPacketHeaderLength = 36;
 constexpr uint16_t kPacketFlagKeyFrame = 1 << 0;
-constexpr const char *kBonjourServiceType = "_iphonecam._udp";
+// The iPhone listens on this port and advertises itself under this Bonjour type, named after the camera.
+constexpr uint16_t kStreamPort = 8240;
+constexpr const char *kPhoneServiceType = "_iphonecam._tcp";
+constexpr const char *kTransportUSB = "usb";
+constexpr const char *kTransportWiFi = "wifi";
 
 struct CameraPacket {
     PacketKind kind = PacketKind::FrameFragment;
@@ -68,6 +79,8 @@ enum class ControlAction {
     StopZoom,
     ResetZoom,
     RequestKeyFrame,
+    // Sent right after connecting: how this receiver reached the iPhone and what it is called.
+    Identify,
 };
 
 enum class ControlSpeed {
@@ -79,6 +92,9 @@ enum class ControlSpeed {
 struct ControlCommand {
     ControlAction action = ControlAction::StopZoom;
     ControlSpeed speed = ControlSpeed::Medium;
+    // Identify only.
+    std::string transport;
+    std::string clientName;
 };
 
 std::optional<CameraPacket> parsePacket(const uint8_t *data, size_t size);

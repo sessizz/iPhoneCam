@@ -30,7 +30,7 @@
 	<string>public.app-category.video</string>
 	<key>NSBonjourServices</key>
 	<array>
-		<string>_iphonecam._udp.</string>
+		<string>_iphonecam._tcp.</string>
 	</array>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>iPhone kamera uygulamasından düşük gecikmeli görüntü almak için yerel ağ kullanılır.</string>

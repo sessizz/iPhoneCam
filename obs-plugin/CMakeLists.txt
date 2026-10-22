@@ -17,6 +17,7 @@ option(IPHONECAM_BUILD_TESTS "Build iPhoneCam OBS plugin unit tests" ON)
 set(IPHONECAM_CORE_SOURCES
     src/protocol.cpp
     src/frame_reassembler.cpp
+    src/stream_support.cpp
 )
 
 add_library(iphonecam_obs_core STATIC ${IPHONECAM_CORE_SOURCES})
@@ -91,6 +92,12 @@ if(APPLE AND IPHONECAM_BUILD_OBS_PLUGIN)
         MACOSX_BUNDLE_INFO_PLIST "${CMAKE_CURRENT_SOURCE_DIR}/resources/Info.plist.in"
         BUILD_WITH_INSTALL_RPATH TRUE
         INSTALL_RPATH "@loader_path/../../../Frameworks;${OBS_APP_PATH}/Contents/Frameworks"
+    )
+    # The linker signs the binary before the bundle gets its Info.plist, leaving the bundle's seal inconsistent;
+    # re-sign the finished bundle ad hoc so it verifies as a whole.
+    add_custom_command(TARGET iphonecam-obs POST_BUILD
+        COMMAND codesign --force --sign - "$<TARGET_BUNDLE_DIR:iphonecam-obs>"
+        VERBATIM
     )
 endif()
 

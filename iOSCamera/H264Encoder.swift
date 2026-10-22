@@ -57,6 +57,11 @@ struct H264Format: Equatable {
         self.vps = vps
     }
 
+    /// Same decoder configuration; the bitrate field is informational and changes with every encoder rebuild.
+    func describesSameStream(as other: H264Format) -> Bool {
+        codec == other.codec && width == other.width && height == other.height && sps == other.sps && pps == other.pps && vps == other.vps
+    }
+
     var payload: FormatPayload {
         FormatPayload(
             codec: codec,
@@ -84,10 +89,13 @@ final class H264Encoder {
     var onSample: ((EncodedH264Sample) -> Void)?
 
     let codec: VideoCodecType
+    let quality: StreamQuality
     private let width: Int
     private let height: Int
     private let fps: Int
     private let bitrate: Int
+    /// The rate the session is running at; VideoToolbox honors mid-stream cuts but not raises.
+    private(set) var appliedBitrate: Int
     private var compressionSession: VTCompressionSession?
     private var frameId: UInt64 = 0
     private var currentFormat: H264Format?
@@ -96,12 +104,14 @@ final class H264Encoder {
     private var lastForcedKeyFrameDate = Date.distantPast
     private let minimumForcedKeyFrameInterval: TimeInterval = 0.25
 
-    init(codec: VideoCodecType = .hevc, width: Int, height: Int, fps: Int, bitrate: Int? = nil) {
+    init(codec: VideoCodecType = .hevc, quality: StreamQuality = .balanced, width: Int, height: Int, fps: Int, bitrate: Int? = nil) {
         self.codec = codec
+        self.quality = quality
         self.width = width
         self.height = height
         self.fps = fps
         self.bitrate = bitrate ?? codec.defaultBitrate
+        appliedBitrate = self.bitrate
         createSession()
     }
 
@@ -110,6 +120,16 @@ final class H264Encoder {
             VTCompressionSessionCompleteFrames(compressionSession, untilPresentationTimeStamp: .invalid)
             VTCompressionSessionInvalidate(compressionSession)
         }
+    }
+
+    /// Lowers the target mid-stream. Raising it this way has no effect on Apple's hardware encoder (measured: a
+    /// session cut to 2 Mbps stays there after the target goes back to 8), so raises need a new encoder.
+    func setBitrate(_ bitsPerSecond: Int) {
+        guard let compressionSession else {
+            return
+        }
+        applyBitrate(bitsPerSecond, to: compressionSession)
+        appliedBitrate = bitsPerSecond
     }
 
     func requestKeyFrame() {
@@ -191,13 +211,11 @@ final class H264Encoder {
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxKeyFrameInterval, value: (fps * 3) as CFTypeRef)
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, value: 3.0 as CFTypeRef)
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_ExpectedFrameRate, value: fps as CFTypeRef)
-        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AverageBitRate, value: bitrate as CFTypeRef)
-        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality, value: kCFBooleanTrue)
+        // Maximum spends the encoder's spare time on quality; at 1080p that costs a few milliseconds per frame.
+        let prioritizeSpeed = quality == .balanced ? kCFBooleanTrue : kCFBooleanFalse
+        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality, value: prioritizeSpeed)
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxFrameDelayCount, value: 1 as CFTypeRef)
-
-        let byteLimit = (bitrate * 3) / (2 * 8)
-        let dataRateLimits: [Any] = [byteLimit, 1.0]
-        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_DataRateLimits, value: dataRateLimits as CFArray)
+        applyBitrate(bitrate, to: session)
 
         if codec == .hevc {
             VTSessionSetProperty(session, key: kVTCompressionPropertyKey_ProfileLevel, value: kVTProfileLevel_HEVC_Main_AutoLevel)
@@ -205,6 +223,16 @@ final class H264Encoder {
             VTSessionSetProperty(session, key: kVTCompressionPropertyKey_ProfileLevel, value: kVTProfileLevel_H264_Main_AutoLevel)
         }
         VTCompressionSessionPrepareToEncodeFrames(session)
+    }
+
+    /// Average target plus a hard cap over one-second windows, so hard-to-compress scenes cannot overshoot the
+    /// average far enough to flood the link. Maximum allows larger peaks because the adaptive loop watches the link.
+    private func applyBitrate(_ bitsPerSecond: Int, to session: VTCompressionSession) {
+        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AverageBitRate, value: bitsPerSecond as CFTypeRef)
+        let peakFactor = quality == .maximum ? 2.0 : 1.5
+        let bytesPerSecondCap = Int(Double(bitsPerSecond) / 8 * peakFactor)
+        let dataRateLimits: [Any] = [bytesPerSecondCap, 1.0]
+        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_DataRateLimits, value: dataRateLimits as CFArray)
     }
 
     private func handleEncodedSample(_ sampleBuffer: CMSampleBuffer, frameId: UInt64) {

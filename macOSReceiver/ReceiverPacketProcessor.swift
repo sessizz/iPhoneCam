@@ -40,7 +40,7 @@ final class ReceiverPacketProcessor: @unchecked Sendable {
                 lastForwardedFrameId = frame.frameId
                 onFrame?(frame, reassembler.droppedFrameCount)
             }
-        case .control, .audio:
+        case .control, .audio, .ping, .timeSyncRequest, .timeSyncResponse:
             break
         }
     }

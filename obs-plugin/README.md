@@ -1,6 +1,6 @@
 # iPhoneCam OBS Plugin
 
-macOS-only OBS input source for receiving the iPhoneCam UDP/Bonjour H.264 stream directly inside OBS.
+macOS-only OBS input source that receives the iPhoneCam stream directly inside OBS, over a USB cable or Wi-Fi.
 
 ## Build
 
@@ -21,8 +21,14 @@ The plugin bundle is produced as `build/obs-plugin/iphonecam-obs.plugin`.
 
 ## v1 Notes
 
-- Add source type `iPhoneCam` in OBS.
-- Keep the standalone Mac receiver app closed while testing, because both advertise `_iphonecam._udp`.
+- Add source type `iPhoneCam` in OBS and choose a **Connection**:
+  - **USB cable**: dials the first iPhone running iPhoneCam through `usbmuxd`, or the one named in **Target iPhone**
+    (pin names to keep several iPhones on fixed sources).
+  - **Wi-Fi**: type the IP address the app shows (`192.168.1.23`, optionally `:port`) or pick the iPhone by name from
+    the list; a name keeps working when the phone's IP changes. The source redials every second until the phone
+    answers and reconnects on its own after a drop.
+- The stats show the connection, the capture-to-decode latency (measured with a clock sync against the phone) and
+  the clock round trip.
 - Bind the `iPhoneCam: Zoom In Slow/Medium/Fast`, `iPhoneCam: Zoom Out Slow/Medium/Fast`, and
   `iPhoneCam: Reset Zoom` actions in OBS Settings > Hotkeys. Press-and-hold zoom keys ramp the iPhone lens;
   releasing the key stops the ramp.

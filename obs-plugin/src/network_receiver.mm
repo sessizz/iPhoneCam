@@ -1,22 +1,31 @@
 #include "network_receiver.hpp"
 #include "protocol.hpp"
+#include "stream_support.hpp"
 
 #include <util/base.h>
 
-#include <algorithm>
-#include <array>
-#include <chrono>
+#include <arpa/inet.h>
+#include <atomic>
 #include <cerrno>
+#include <chrono>
+#include <condition_variable>
 #include <cstring>
 #include <dns_sd.h>
+#include <fcntl.h>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <poll.h>
+#include <pthread.h>
+#include <set>
 #include <string>
-#include <sys/fcntl.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <sys/un.h>
+#include <thread>
 #include <unistd.h>
 #include <vector>
 
@@ -25,25 +34,81 @@
 namespace iphonecam {
 namespace {
 
-constexpr auto kEndpointTimeout = std::chrono::milliseconds(1500);
+constexpr auto kConnectTimeout = std::chrono::milliseconds(3000);
+constexpr auto kRetryDelay = std::chrono::milliseconds(1000);
+// The iPhone pings every 2 s, so this much silence means the link is gone even if TCP has not noticed yet.
+constexpr auto kIdleTimeout = std::chrono::milliseconds(6000);
+constexpr auto kWaitForSettingsChange = std::chrono::hours(24);
 
 std::mutex gDevicesMutex;
 std::vector<std::string> gDiscoveredDevices;
 
-std::string endpointDescription(const sockaddr_storage &address, socklen_t addressLength)
+std::string localComputerName()
 {
-    char host[NI_MAXHOST] = {};
-    char service[NI_MAXSERV] = {};
-    const int result = getnameinfo(reinterpret_cast<const sockaddr *>(&address), addressLength, host, sizeof(host),
-                                   service, sizeof(service), NI_NUMERICHOST | NI_NUMERICSERV);
-    if (result != 0)
-        return "unknown";
-    return std::string(host) + ":" + std::string(service);
+    @autoreleasepool {
+        NSString *name = [[NSHost currentHost] localizedName];
+        return name ? std::string(name.UTF8String) : std::string("Mac");
+    }
 }
 
-std::string errnoDescription(const char *operation)
+std::vector<uint8_t> framedControl(const ControlCommand &command)
 {
-    return std::string(operation) + " failed: " + std::strerror(errno);
+    CameraPacket packet;
+    packet.kind = PacketKind::Control;
+    packet.streamId = 1;
+    packet.payload = encodeControlPayload(command);
+    return encodeFramedPacket(packet);
+}
+
+std::vector<uint8_t> framedIdentify(const char *transport)
+{
+    ControlCommand command;
+    command.action = ControlAction::Identify;
+    command.transport = transport;
+    command.clientName = "OBS on " + localComputerName();
+    return framedControl(command);
+}
+
+// Small control packets only; a send timeout keeps a stalled peer from blocking a caller for long.
+void setSendTimeout(int fd)
+{
+    timeval timeout = {};
+    timeout.tv_sec = 1;
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+}
+
+void configureStreamSocket(int fd, bool tcp)
+{
+    const int yes = 1;
+    setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &yes, sizeof(yes));
+    const int receiveBuffer = 4 * 1024 * 1024;
+    setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &receiveBuffer, sizeof(receiveBuffer));
+    setSendTimeout(fd);
+    if (!tcp)
+        return;
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof(yes));
+    // Without keepalive a silently dead link (Wi-Fi drop, no RST) looks connected for minutes.
+    setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &yes, sizeof(yes));
+    const int idle = 5;
+    const int interval = 5;
+    const int count = 2;
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPALIVE, &idle, sizeof(idle));
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &interval, sizeof(interval));
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &count, sizeof(count));
+}
+
+bool sendAll(int fd, const std::vector<uint8_t> &data)
+{
+    size_t sent = 0;
+    while (sent < data.size()) {
+        const ssize_t n = send(fd, data.data() + sent, data.size() - sent, 0);
+        if (n < 0 && errno == EINTR)
+            continue;
+        if (n <= 0)
+            return false;
+        sent += size_t(n);
+    }
+    return true;
 }
 
 int connectUsbmuxd()
@@ -99,10 +164,8 @@ NSDictionary *readUsbmuxPlist(int fd)
             return nil;
         totalRead += static_cast<size_t>(n);
     }
-    const uint32_t totalLen = static_cast<uint32_t>(hdr[0]) |
-                              (static_cast<uint32_t>(hdr[1]) << 8) |
-                              (static_cast<uint32_t>(hdr[2]) << 16) |
-                              (static_cast<uint32_t>(hdr[3]) << 24);
+    const uint32_t totalLen = static_cast<uint32_t>(hdr[0]) | (static_cast<uint32_t>(hdr[1]) << 8) |
+                              (static_cast<uint32_t>(hdr[2]) << 16) | (static_cast<uint32_t>(hdr[3]) << 24);
     if (totalLen < 16)
         return nil;
     const size_t payloadLen = totalLen - 16;
@@ -119,12 +182,196 @@ NSDictionary *readUsbmuxPlist(int fd)
     }
     NSData *data = [NSData dataWithBytes:payloadBuf.data() length:payloadBuf.size()];
     NSError *error = nil;
-    NSDictionary *dict = [NSPropertyListSerialization propertyListWithData:data
-                                                                   options:0
-                                                                    format:nil
-                                                                     error:&error];
+    NSDictionary *dict = [NSPropertyListSerialization propertyListWithData:data options:0 format:nil error:&error];
     return [dict isKindOfClass:[NSDictionary class]] ? dict : nil;
 }
+
+// MARK: - PhoneDiscovery (Bonjour browse of iPhones running the stream listener)
+
+class PhoneDiscovery {
+public:
+    static PhoneDiscovery &instance()
+    {
+        static PhoneDiscovery discovery;
+        return discovery;
+    }
+
+    void start()
+    {
+        dispatch_async(queue_, ^{
+          if (browseRef_)
+              return;
+          DNSServiceRef ref = nullptr;
+          const DNSServiceErrorType error =
+              DNSServiceBrowse(&ref, 0, kDNSServiceInterfaceIndexAny, kPhoneServiceType, nullptr, browseReply, this);
+          if (error != kDNSServiceErr_NoError) {
+              blog(LOG_WARNING, "[iPhoneCam] Bonjour browse for iPhones failed: %d", int(error));
+              return;
+          }
+          DNSServiceSetDispatchQueue(ref, queue_);
+          browseRef_ = ref;
+        });
+    }
+
+    void stop()
+    {
+        dispatch_sync(queue_, ^{
+          if (browseRef_) {
+              DNSServiceRefDeallocate(browseRef_);
+              browseRef_ = nullptr;
+          }
+          std::lock_guard<std::mutex> lock(mutex_);
+          for (auto &entry : phones_)
+              release(entry.second);
+          phones_.clear();
+        });
+    }
+
+    std::vector<std::string> names() const
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        std::vector<std::string> result;
+        for (const auto &entry : phones_)
+            result.push_back(entry.first);
+        return result;
+    }
+
+    std::optional<HostPort> lookup(const std::string &name) const
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const auto it = phones_.find(name);
+        if (it == phones_.end() || it->second.port == 0)
+            return std::nullopt;
+        const auto &phone = it->second;
+        if (!phone.address.empty())
+            return HostPort{phone.address, phone.port};
+        if (!phone.hostTarget.empty())
+            return HostPort{phone.hostTarget, phone.port};
+        return std::nullopt;
+    }
+
+private:
+    struct Context {
+        PhoneDiscovery *owner;
+        std::string name;
+    };
+
+    struct Phone {
+        std::set<uint32_t> interfaces;
+        std::string hostTarget;
+        std::string address;
+        uint16_t port = 0;
+        DNSServiceRef resolveRef = nullptr;
+        DNSServiceRef addressRef = nullptr;
+        Context *context = nullptr;
+    };
+
+    PhoneDiscovery() = default;
+
+    // Callers hold mutex_; runs on queue_.
+    static void release(Phone &phone)
+    {
+        if (phone.resolveRef) {
+            DNSServiceRefDeallocate(phone.resolveRef);
+            phone.resolveRef = nullptr;
+        }
+        if (phone.addressRef) {
+            DNSServiceRefDeallocate(phone.addressRef);
+            phone.addressRef = nullptr;
+        }
+        delete phone.context;
+        phone.context = nullptr;
+    }
+
+    static void DNSSD_API browseReply(DNSServiceRef, DNSServiceFlags flags, uint32_t interfaceIndex,
+                                      DNSServiceErrorType error, const char *serviceName, const char *regtype,
+                                      const char *replyDomain, void *context)
+    {
+        auto *self = static_cast<PhoneDiscovery *>(context);
+        if (error != kDNSServiceErr_NoError || !serviceName)
+            return;
+        const std::string name(serviceName);
+        std::lock_guard<std::mutex> lock(self->mutex_);
+        if (flags & kDNSServiceFlagsAdd) {
+            auto &phone = self->phones_[name];
+            const bool first = phone.interfaces.empty();
+            phone.interfaces.insert(interfaceIndex);
+            if (!first)
+                return;
+            phone.context = new Context{self, name};
+            DNSServiceRef ref = nullptr;
+            if (DNSServiceResolve(&ref, 0, interfaceIndex, serviceName, regtype, replyDomain, resolveReply,
+                                  phone.context) == kDNSServiceErr_NoError) {
+                DNSServiceSetDispatchQueue(ref, self->queue_);
+                phone.resolveRef = ref;
+            }
+            return;
+        }
+
+        const auto it = self->phones_.find(name);
+        if (it == self->phones_.end())
+            return;
+        it->second.interfaces.erase(interfaceIndex);
+        if (it->second.interfaces.empty()) {
+            release(it->second);
+            self->phones_.erase(it);
+        }
+    }
+
+    static void DNSSD_API resolveReply(DNSServiceRef, DNSServiceFlags, uint32_t interfaceIndex,
+                                       DNSServiceErrorType error, const char *, const char *hostTarget,
+                                       uint16_t portNetworkOrder, uint16_t, const unsigned char *, void *context)
+    {
+        auto *ctx = static_cast<Context *>(context);
+        if (error != kDNSServiceErr_NoError || !hostTarget)
+            return;
+        PhoneDiscovery *self = ctx->owner;
+        std::lock_guard<std::mutex> lock(self->mutex_);
+        const auto it = self->phones_.find(ctx->name);
+        if (it == self->phones_.end() || it->second.context != ctx)
+            return;
+        auto &phone = it->second;
+        phone.hostTarget = hostTarget;
+        phone.port = ntohs(portNetworkOrder);
+        if (phone.resolveRef) {
+            DNSServiceRefDeallocate(phone.resolveRef);
+            phone.resolveRef = nullptr;
+        }
+        if (phone.addressRef) {
+            DNSServiceRefDeallocate(phone.addressRef);
+            phone.addressRef = nullptr;
+        }
+        DNSServiceRef ref = nullptr;
+        if (DNSServiceGetAddrInfo(&ref, 0, interfaceIndex, kDNSServiceProtocol_IPv4, hostTarget, addressReply, ctx) ==
+            kDNSServiceErr_NoError) {
+            DNSServiceSetDispatchQueue(ref, self->queue_);
+            phone.addressRef = ref;
+        }
+    }
+
+    static void DNSSD_API addressReply(DNSServiceRef, DNSServiceFlags flags, uint32_t, DNSServiceErrorType error,
+                                       const char *, const sockaddr *address, uint32_t, void *context)
+    {
+        auto *ctx = static_cast<Context *>(context);
+        if (error != kDNSServiceErr_NoError || !address || address->sa_family != AF_INET ||
+            !(flags & kDNSServiceFlagsAdd))
+            return;
+        char text[INET_ADDRSTRLEN] = {};
+        const auto *ipv4 = reinterpret_cast<const sockaddr_in *>(address);
+        if (!inet_ntop(AF_INET, &ipv4->sin_addr, text, sizeof(text)))
+            return;
+        PhoneDiscovery *self = ctx->owner;
+        std::lock_guard<std::mutex> lock(self->mutex_);
+        const auto it = self->phones_.find(ctx->name);
+        if (it != self->phones_.end() && it->second.context == ctx)
+            it->second.address = text;
+    }
+
+    dispatch_queue_t queue_ = dispatch_queue_create("iphonecam.obs.discovery", DISPATCH_QUEUE_SERIAL);
+    DNSServiceRef browseRef_ = nullptr;
+    mutable std::mutex mutex_;
+    std::map<std::string, Phone> phones_;
+};
 
 } // namespace
 
@@ -139,93 +386,57 @@ void registerDiscoveredDevice(const std::string &name)
     if (name.empty() || name == "Auto" || name == "-")
         return;
     std::lock_guard<std::mutex> lock(gDevicesMutex);
-    if (std::find(gDiscoveredDevices.begin(), gDiscoveredDevices.end(), name) == gDiscoveredDevices.end()) {
+    if (std::find(gDiscoveredDevices.begin(), gDiscoveredDevices.end(), name) == gDiscoveredDevices.end())
         gDiscoveredDevices.push_back(name);
-    }
+}
+
+void startPhoneDiscovery()
+{
+    PhoneDiscovery::instance().start();
+}
+
+void stopPhoneDiscovery()
+{
+    PhoneDiscovery::instance().stop();
+}
+
+std::vector<std::string> getDiscoveredPhoneNames()
+{
+    return PhoneDiscovery::instance().names();
 }
 
 struct NetworkReceiver::Impl {
     dispatch_queue_t queue = dispatch_queue_create("iphonecam.obs.receiver", DISPATCH_QUEUE_SERIAL);
-    dispatch_source_t readSource = nullptr;
-    dispatch_source_t timeoutSource = nullptr;
-    DNSServiceRef bonjourService = nullptr;
-    int socketFd = -1;
-    uint16_t port = 0;
-    std::string currentReceiverName;
-    std::string targetDevice;
-    std::string activeEndpoint;
-    sockaddr_storage activeAddress = {};
-    socklen_t activeAddressLength = 0;
-    std::chrono::steady_clock::time_point lastPacketAt;
     PacketCallback onPacket;
     StatusCallback onStatus;
+    // Set by start() before any connection work begins and left alone until stop() has finished.
+    ReceiverConfig config;
+    std::atomic<bool> isRunning{false};
 
-    bool isRunning = false;
+    // USB state, confined to `queue`.
     bool isUsbConnected = false;
-    int usbDeviceID = -1;
     std::string usbDeviceName;
-    std::string connectedDeviceName;
+
+    // Wi-Fi dial loop.
+    std::thread wifiThread;
+    std::atomic<bool> wifiRunning{false};
+    std::mutex wifiMutex;
+    std::condition_variable wifiWake;
+    int wifiFd = -1;
 
     ~Impl()
     {
         stop();
         dispatch_sync(queue, ^{
-            onPacket = nullptr;
-            onStatus = nullptr;
+          onPacket = nullptr;
+          onStatus = nullptr;
         });
     }
 
-    void publishStatus(const std::string &status, uint16_t port = 0)
+    void publishStatus(const std::string &status, const std::string &connection, bool connected)
     {
         if (onStatus)
-            onStatus(status, port);
-    }
-
-    void setTargetDevice(std::string target);
-    void start(const std::string &receiverName);
-    void stop();
-
-    void updateBonjourTxt(bool isBusy)
-    {
-        if (!bonjourService)
-            return;
-
-        TXTRecordRef txtRecord;
-        TXTRecordCreate(&txtRecord, 0, nullptr);
-        const std::string tgt = targetDevice.empty() ? "*" : targetDevice;
-        TXTRecordSetValue(&txtRecord, "target", static_cast<uint8_t>(tgt.length()), tgt.c_str());
-        const char *busyVal = isBusy ? "1" : "0";
-        TXTRecordSetValue(&txtRecord, "busy", 1, busyVal);
-        const std::string &dev = isUsbConnected ? usbDeviceName : connectedDeviceName;
-        if (!dev.empty()) {
-            TXTRecordSetValue(&txtRecord, "device", static_cast<uint8_t>(dev.length()), dev.c_str());
-        }
-
-        DNSServiceUpdateRecord(bonjourService, nullptr, 0, TXTRecordGetLength(&txtRecord),
-                               TXTRecordGetBytesPtr(&txtRecord), 0);
-        TXTRecordDeallocate(&txtRecord);
-    }
-
-    void onUsbConnected(int devID, std::string name)
-    {
-        dispatch_async(queue, ^{
-            isUsbConnected = true;
-            usbDeviceID = devID;
-            usbDeviceName = std::move(name);
-            updateBonjourTxt(true);
-            publishStatus("Connected to " + usbDeviceName + " via USB Cable", port);
-        });
-    }
-
-    void onUsbDisconnected()
-    {
-        dispatch_async(queue, ^{
-            isUsbConnected = false;
-            usbDeviceID = -1;
-            usbDeviceName.clear();
-            updateBonjourTxt(!activeEndpoint.empty());
-            publishStatus(activeEndpoint.empty() ? "Waiting for iPhone" : ("Connected: " + activeEndpoint), port);
-        });
+            onStatus(status, connection, connected);
     }
 
     void dispatchPacket(std::shared_ptr<std::vector<uint8_t>> packet)
@@ -233,166 +444,30 @@ struct NetworkReceiver::Impl {
         if (!packet)
             return;
         dispatch_async(queue, ^{
-            if (onPacket && packet)
-                onPacket(*packet);
+          if (isRunning && onPacket && packet)
+              onPacket(*packet);
         });
     }
 
-    void dispatchPacket(const std::vector<uint8_t> &data)
+    void start(const ReceiverConfig &next);
+    void stop();
+    void onUsbConnected(int deviceID, std::string name);
+    void onUsbDisconnected();
+    void sendFramed(const std::vector<uint8_t> &bytes);
+
+    void wifiLoop(ReceiverConfig settings);
+    int dial(const HostPort &target);
+    void readWifi(int fd);
+    void stopWifi();
+
+    void waitForRetry(std::chrono::milliseconds delay)
     {
-        auto packet = std::make_shared<std::vector<uint8_t>>(data);
-        dispatchPacket(packet);
-    }
-
-    void sendControlCommand(const ControlCommand &command);
-
-    bool publishBonjour(const std::string &receiverName, uint16_t servicePort, const std::string &target)
-    {
-        if (bonjourService) {
-            DNSServiceRefDeallocate(bonjourService);
-            bonjourService = nullptr;
-        }
-
-        TXTRecordRef txtRecord;
-        TXTRecordCreate(&txtRecord, 0, nullptr);
-        const std::string tgt = target.empty() ? "*" : target;
-        TXTRecordSetValue(&txtRecord, "target", static_cast<uint8_t>(tgt.length()), tgt.c_str());
-        const bool isBusy = isUsbConnected || !activeEndpoint.empty();
-        const char *busyVal = isBusy ? "1" : "0";
-        TXTRecordSetValue(&txtRecord, "busy", 1, busyVal);
-        const std::string &dev = isUsbConnected ? usbDeviceName : connectedDeviceName;
-        if (!dev.empty()) {
-            TXTRecordSetValue(&txtRecord, "device", static_cast<uint8_t>(dev.length()), dev.c_str());
-        }
-
-        const DNSServiceErrorType error = DNSServiceRegister(
-            &bonjourService, 0, 0, receiverName.c_str(), "_iphonecam._udp.", nullptr, nullptr, htons(servicePort),
-            TXTRecordGetLength(&txtRecord), TXTRecordGetBytesPtr(&txtRecord),
-            [](DNSServiceRef, DNSServiceFlags, DNSServiceErrorType errorCode, const char *name, const char *,
-               const char *, void *) {
-              if (errorCode == kDNSServiceErr_NoError) {
-                  blog(LOG_INFO, "[iPhoneCam] OBS Bonjour service registered as '%s'", name ? name : "iPhoneCam OBS");
-              } else {
-                  blog(LOG_ERROR, "[iPhoneCam] OBS Bonjour registration callback error: %d", int(errorCode));
-              }
-            },
-            nullptr);
-
-        TXTRecordDeallocate(&txtRecord);
-        return error == kDNSServiceErr_NoError;
-    }
-
-    void receiveAvailable()
-    {
-        std::array<uint8_t, 4096> buffer = {};
-        for (;;) {
-            sockaddr_storage sender = {};
-            socklen_t senderLength = sizeof(sender);
-            const ssize_t bytesRead =
-                recvfrom(socketFd, buffer.data(), buffer.size(), 0, reinterpret_cast<sockaddr *>(&sender), &senderLength);
-            if (bytesRead < 0) {
-                if (errno == EAGAIN || errno == EWOULDBLOCK)
-                    break;
-                blog(LOG_WARNING, "[iPhoneCam] OBS UDP recvfrom failed: %s", std::strerror(errno));
-                break;
-            }
-            if (bytesRead == 0)
-                continue;
-
-            if (isUsbConnected) {
-                continue;
-            }
-
-            auto parsed = parsePacket(buffer.data(), static_cast<size_t>(bytesRead));
-            if (parsed && parsed->kind == PacketKind::Hello) {
-                auto hello = parseHelloPayload(parsed->payload);
-                if (hello) {
-                    registerDiscoveredDevice(hello->deviceName);
-                    if (!targetDevice.empty() && hello->deviceName != targetDevice) {
-                        continue;
-                    }
-                    if (connectedDeviceName != hello->deviceName) {
-                        connectedDeviceName = hello->deviceName;
-                        updateBonjourTxt(true);
-                    }
-                }
-            }
-
-            const std::string endpoint = endpointDescription(sender, senderLength);
-            const auto now = std::chrono::steady_clock::now();
-            if (activeEndpoint.empty()) {
-                activeEndpoint = endpoint;
-                activeAddress = sender;
-                activeAddressLength = senderLength;
-                lastPacketAt = now;
-                updateBonjourTxt(true);
-                blog(LOG_INFO, "[iPhoneCam] OBS receiver accepted iPhone endpoint %s", activeEndpoint.c_str());
-                publishStatus("Connected: " + activeEndpoint, port);
-            } else if (endpoint != activeEndpoint) {
-                if (now - lastPacketAt > kEndpointTimeout) {
-                    blog(LOG_INFO, "[iPhoneCam] OBS receiver accepted reconnect endpoint %s (previous %s)",
-                         endpoint.c_str(), activeEndpoint.c_str());
-                    activeEndpoint = endpoint;
-                    activeAddress = sender;
-                    activeAddressLength = senderLength;
-                    lastPacketAt = now;
-                    updateBonjourTxt(true);
-                    publishStatus("Connected: " + activeEndpoint, port);
-                } else {
-                    blog(LOG_INFO, "[iPhoneCam] OBS receiver ignored second endpoint %s", endpoint.c_str());
-                    continue;
-                }
-            } else {
-                lastPacketAt = now;
-            }
-
-            if (onPacket) {
-                onPacket(std::vector<uint8_t>(buffer.begin(), buffer.begin() + bytesRead));
-            }
-        }
-    }
-
-    void startTimeoutTimer()
-    {
-        timeoutSource = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, queue);
-        dispatch_source_set_timer(timeoutSource, dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_MSEC * 500),
-                                  NSEC_PER_MSEC * 500, NSEC_PER_MSEC * 100);
-        dispatch_source_set_event_handler(timeoutSource, ^{
-          checkEndpointTimeout();
-        });
-        dispatch_resume(timeoutSource);
-    }
-
-    void checkEndpointTimeout()
-    {
-        if (isUsbConnected)
-            return;
-
-        if (activeEndpoint.empty() || lastPacketAt.time_since_epoch().count() == 0)
-            return;
-
-        const auto now = std::chrono::steady_clock::now();
-        if (now - lastPacketAt <= kEndpointTimeout)
-            return;
-
-        blog(LOG_INFO, "[iPhoneCam] OBS receiver endpoint timed out: %s", activeEndpoint.c_str());
-        activeEndpoint.clear();
-        connectedDeviceName.clear();
-        activeAddress = {};
-        activeAddressLength = 0;
-        lastPacketAt = {};
-        updateBonjourTxt(isUsbConnected);
-        publishStatus("Waiting for iPhone", port);
-    }
-
-    void fail(const std::string &message)
-    {
-        blog(LOG_ERROR, "[iPhoneCam] OBS receiver error: %s", message.c_str());
-        publishStatus("Receiver failed: " + message, 0);
+        std::unique_lock<std::mutex> lock(wifiMutex);
+        wifiWake.wait_for(lock, delay, [this] { return !wifiRunning.load(); });
     }
 };
 
-// MARK: - UsbmuxDeviceManager (Shared Multi-Device Manager)
+// MARK: - UsbmuxDeviceManager (one usbmuxd listener shared by every source)
 
 struct UsbmuxDevice {
     int deviceID = -1;
@@ -401,7 +476,7 @@ struct UsbmuxDevice {
     int streamFd = -1;
     bool isConnecting = false;
     NetworkReceiver::Impl *owner = nullptr;
-    std::vector<uint8_t> rxBuffer;
+    PacketStreamFramer framer;
 };
 
 struct RegisteredReceiver {
@@ -417,6 +492,50 @@ public:
         return s_instance;
     }
 
+    void registerReceiver(NetworkReceiver::Impl *receiver, std::string targetDevice)
+    {
+        dispatch_sync(queue_, ^{
+          auto it = std::find_if(receivers_.begin(), receivers_.end(),
+                                 [receiver](const RegisteredReceiver &r) { return r.impl == receiver; });
+          if (it == receivers_.end()) {
+              receivers_.push_back({receiver, targetDevice});
+          } else {
+              it->targetDevice = targetDevice;
+          }
+          startListeningIfNeeded();
+          reevaluateAssignments();
+        });
+    }
+
+    void unregisterReceiver(NetworkReceiver::Impl *receiver)
+    {
+        dispatch_sync(queue_, ^{
+          for (auto &pair : devices_) {
+              if (pair.second.owner == receiver)
+                  pair.second.owner = nullptr;
+          }
+          receivers_.erase(std::remove_if(receivers_.begin(), receivers_.end(),
+                                          [receiver](const RegisteredReceiver &r) { return r.impl == receiver; }),
+                           receivers_.end());
+          reevaluateAssignments();
+        });
+    }
+
+    void sendFramed(NetworkReceiver::Impl *receiver, const std::vector<uint8_t> &bytes)
+    {
+        dispatch_sync(queue_, ^{
+          for (auto &pair : devices_) {
+              if (pair.second.owner == receiver && pair.second.streamFd >= 0) {
+                  sendAll(pair.second.streamFd, bytes);
+                  break;
+              }
+          }
+        });
+    }
+
+private:
+    UsbmuxDeviceManager() = default;
+
     bool isReceiverAssigned(NetworkReceiver::Impl *receiver) const
     {
         for (const auto &pair : devices_) {
@@ -426,90 +545,14 @@ public:
         return false;
     }
 
-    void registerReceiver(NetworkReceiver::Impl *receiver, std::string targetDevice)
+    void retryListeningLater()
     {
-        dispatch_sync(queue_, ^{
-            auto it = std::find_if(receivers_.begin(), receivers_.end(),
-                                   [receiver](const RegisteredReceiver &r) { return r.impl == receiver; });
-            if (it == receivers_.end()) {
-                receivers_.push_back({receiver, std::move(targetDevice)});
-            } else {
-                it->targetDevice = std::move(targetDevice);
-            }
-            startListeningIfNeeded();
-            reevaluateAssignments();
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2000 * NSEC_PER_MSEC), queue_, ^{
+          isListening_ = false;
+          if (!receivers_.empty())
+              startListeningIfNeeded();
         });
     }
-
-    void unregisterReceiver(NetworkReceiver::Impl *receiver)
-    {
-        dispatch_sync(queue_, ^{
-            for (auto &pair : devices_) {
-                if (pair.second.owner == receiver) {
-                    pair.second.owner = nullptr;
-                }
-            }
-            receivers_.erase(
-                std::remove_if(receivers_.begin(), receivers_.end(),
-                               [receiver](const RegisteredReceiver &r) { return r.impl == receiver; }),
-                receivers_.end());
-            reevaluateAssignments();
-        });
-    }
-
-    void setReceiverTarget(NetworkReceiver::Impl *receiver, std::string targetDevice)
-    {
-        dispatch_sync(queue_, ^{
-            for (auto &r : receivers_) {
-                if (r.impl == receiver) {
-                    if (r.targetDevice != targetDevice) {
-                        r.targetDevice = std::move(targetDevice);
-                        for (auto &pair : devices_) {
-                            if (pair.second.owner == receiver) {
-                                if (!r.targetDevice.empty() && pair.second.deviceName != r.targetDevice) {
-                                    pair.second.owner = nullptr;
-                                    receiver->onUsbDisconnected();
-                                }
-                            }
-                        }
-                    }
-                    break;
-                }
-            }
-            reevaluateAssignments();
-        });
-    }
-
-    bool sendControlCommand(NetworkReceiver::Impl *receiver, const ControlCommand &command)
-    {
-        __block bool sent = false;
-        dispatch_sync(queue_, ^{
-            for (auto &pair : devices_) {
-                if (pair.second.owner == receiver && pair.second.streamFd >= 0) {
-                    CameraPacket packet;
-                    packet.kind = PacketKind::Control;
-                    packet.streamId = 1;
-                    packet.payload = encodeControlPayload(command);
-                    const auto encoded = encodePacket(packet);
-
-                    const uint32_t lengthBE = htonl(static_cast<uint32_t>(encoded.size()));
-                    std::vector<uint8_t> framed(4 + encoded.size());
-                    std::memcpy(framed.data(), &lengthBE, 4);
-                    std::memcpy(framed.data() + 4, encoded.data(), encoded.size());
-
-                    const ssize_t n = send(pair.second.streamFd, framed.data(), framed.size(), 0);
-                    if (n > 0) {
-                        sent = true;
-                    }
-                    break;
-                }
-            }
-        });
-        return sent;
-    }
-
-private:
-    UsbmuxDeviceManager() = default;
 
     void startListeningIfNeeded()
     {
@@ -518,58 +561,45 @@ private:
         isListening_ = true;
 
         dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-            int lfd = connectUsbmuxd();
-            if (lfd < 0) {
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2000 * NSEC_PER_MSEC), queue_, ^{
+          int lfd = connectUsbmuxd();
+          if (lfd < 0) {
+              retryListeningLater();
+              return;
+          }
+
+          NSDictionary *listenMsg =
+              @{@"MessageType" : @"Listen", @"ClientVersionString" : @"iPhoneCam", @"ProgName" : @"iPhoneCam"};
+          if (!sendUsbmuxPlist(lfd, listenMsg)) {
+              close(lfd);
+              retryListeningLater();
+              return;
+          }
+
+          dispatch_async(queue_, ^{
+            listenFd_ = lfd;
+            blog(LOG_INFO, "[iPhoneCam] Listening for USB iPhones via /var/run/usbmuxd");
+
+            dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+              while (true) {
+                  NSDictionary *plist = readUsbmuxPlist(lfd);
+                  if (!plist)
+                      break;
+                  dispatch_async(queue_, ^{
+                    if (listenFd_ == lfd)
+                        handleListenPlist(plist);
+                  });
+              }
+              dispatch_async(queue_, ^{
+                if (listenFd_ == lfd) {
+                    close(lfd);
+                    listenFd_ = -1;
                     isListening_ = false;
                     if (!receivers_.empty())
                         startListeningIfNeeded();
-                });
-                return;
-            }
-
-            NSDictionary *listenMsg = @{
-                @"MessageType": @"Listen",
-                @"ClientVersionString": @"iPhoneCam",
-                @"ProgName": @"iPhoneCam"
-            };
-
-            if (!sendUsbmuxPlist(lfd, listenMsg)) {
-                close(lfd);
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2000 * NSEC_PER_MSEC), queue_, ^{
-                    isListening_ = false;
-                    if (!receivers_.empty())
-                        startListeningIfNeeded();
-                });
-                return;
-            }
-
-            dispatch_async(queue_, ^{
-                listenFd_ = lfd;
-                blog(LOG_INFO, "[iPhoneCam] OBS UsbmuxDeviceManager listening on /var/run/usbmuxd");
-
-                dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-                    while (listenFd_ == lfd) {
-                        NSDictionary *plist = readUsbmuxPlist(lfd);
-                        if (!plist)
-                            break;
-                        dispatch_async(queue_, ^{
-                            if (listenFd_ == lfd) {
-                                handleListenPlist(plist);
-                            }
-                        });
-                    }
-                    dispatch_async(queue_, ^{
-                        if (listenFd_ == lfd) {
-                            close(lfd);
-                            listenFd_ = -1;
-                            isListening_ = false;
-                            if (!receivers_.empty())
-                                startListeningIfNeeded();
-                        }
-                    });
-                });
+                }
+              });
             });
+          });
         });
     }
 
@@ -586,33 +616,41 @@ private:
             if (devID && [connType isEqualToString:@"USB"]) {
                 const int idVal = devID.intValue;
                 NSString *serial = props[@"SerialNumber"] ?: @"";
-                UsbmuxDevice dev;
+                UsbmuxDevice &dev = devices_[idVal];
                 dev.deviceID = idVal;
                 dev.serialNumber = [serial UTF8String];
-                dev.isConnecting = false;
-                devices_[idVal] = dev;
-                blog(LOG_INFO, "[iPhoneCam] UsbmuxDeviceManager detected USB device %d", idVal);
+                blog(LOG_INFO, "[iPhoneCam] USB iPhone attached (device %d)", idVal);
                 tryConnectDevice(idVal);
             }
         } else if ([msgType isEqualToString:@"Detached"]) {
             NSNumber *devID = plist[@"DeviceID"];
-            if (devID) {
-                const int idVal = devID.intValue;
-                auto it = devices_.find(idVal);
-                if (it != devices_.end()) {
-                    blog(LOG_INFO, "[iPhoneCam] UsbmuxDeviceManager detached USB device %d", idVal);
-                    if (it->second.owner) {
-                        it->second.owner->onUsbDisconnected();
-                        it->second.owner = nullptr;
-                    }
-                    if (it->second.streamFd >= 0) {
-                        close(it->second.streamFd);
-                    }
-                    devices_.erase(it);
-                    reevaluateAssignments();
-                }
+            if (!devID)
+                return;
+            auto it = devices_.find(devID.intValue);
+            if (it == devices_.end())
+                return;
+            blog(LOG_INFO, "[iPhoneCam] USB iPhone detached (device %d)", devID.intValue);
+            if (it->second.owner) {
+                it->second.owner->onUsbDisconnected();
+                it->second.owner = nullptr;
             }
+            if (it->second.streamFd >= 0)
+                close(it->second.streamFd);
+            devices_.erase(it);
+            reevaluateAssignments();
         }
+    }
+
+    void retryConnectLater(int devID)
+    {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 1500 * NSEC_PER_MSEC), queue_, ^{
+          auto it = devices_.find(devID);
+          if (it == devices_.end())
+              return;
+          it->second.isConnecting = false;
+          if (it->second.streamFd < 0)
+              tryConnectDevice(devID);
+        });
     }
 
     void tryConnectDevice(int devID)
@@ -620,171 +658,122 @@ private:
         auto it = devices_.find(devID);
         if (it == devices_.end() || it->second.streamFd >= 0 || it->second.isConnecting)
             return;
-
         it->second.isConnecting = true;
 
         dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-            int cfd = connectUsbmuxd();
-            if (cfd < 0) {
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 1500 * NSEC_PER_MSEC), queue_, ^{
-                    auto dit = devices_.find(devID);
-                    if (dit != devices_.end()) {
-                        dit->second.isConnecting = false;
-                        if (dit->second.streamFd < 0) {
-                            tryConnectDevice(devID);
-                        }
-                    }
-                });
-                return;
-            }
+          int cfd = connectUsbmuxd();
+          if (cfd < 0) {
+              retryConnectLater(devID);
+              return;
+          }
 
-            const uint16_t portBE = htons(8240);
-            NSDictionary *connectMsg = @{
-                @"MessageType": @"Connect",
-                @"ClientVersionString": @"iPhoneCam",
-                @"ProgName": @"iPhoneCam",
-                @"DeviceID": @(devID),
-                @"PortNumber": @(portBE)
-            };
+          NSDictionary *connectMsg = @{
+              @"MessageType" : @"Connect",
+              @"ClientVersionString" : @"iPhoneCam",
+              @"ProgName" : @"iPhoneCam",
+              @"DeviceID" : @(devID),
+              @"PortNumber" : @(htons(kStreamPort))
+          };
+          NSDictionary *resp = sendUsbmuxPlist(cfd, connectMsg) ? readUsbmuxPlist(cfd) : nil;
+          NSNumber *num = resp[@"Number"];
+          if (!num || num.intValue != 0) {
+              // The app is not listening yet (not open, or still starting); keep trying.
+              close(cfd);
+              retryConnectLater(devID);
+              return;
+          }
 
-            if (!sendUsbmuxPlist(cfd, connectMsg)) {
+          configureStreamSocket(cfd, false);
+          dispatch_async(queue_, ^{
+            auto dit = devices_.find(devID);
+            if (dit == devices_.end()) {
                 close(cfd);
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 1500 * NSEC_PER_MSEC), queue_, ^{
-                    auto dit = devices_.find(devID);
-                    if (dit != devices_.end()) {
-                        dit->second.isConnecting = false;
-                        if (dit->second.streamFd < 0) {
-                            tryConnectDevice(devID);
-                        }
-                    }
-                });
                 return;
             }
+            dit->second.isConnecting = false;
+            dit->second.streamFd = cfd;
+            dit->second.framer.reset();
+            blog(LOG_INFO, "[iPhoneCam] USB stream connected (device %d)", devID);
+            reevaluateAssignments();
 
-            NSDictionary *resp = readUsbmuxPlist(cfd);
-            NSNumber *num = resp[@"Number"];
-            if (!num || num.intValue != 0) {
-                close(cfd);
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 1500 * NSEC_PER_MSEC), queue_, ^{
-                    auto dit = devices_.find(devID);
-                    if (dit != devices_.end()) {
-                        dit->second.isConnecting = false;
-                        if (dit->second.streamFd < 0) {
-                            tryConnectDevice(devID);
-                        }
-                    }
-                });
-                return;
-            }
-
-            dispatch_async(queue_, ^{
-                auto dit = devices_.find(devID);
-                if (dit == devices_.end()) {
-                    close(cfd);
-                    return;
-                }
-                dit->second.isConnecting = false;
-                dit->second.streamFd = cfd;
-                dit->second.rxBuffer.clear();
-                blog(LOG_INFO, "[iPhoneCam] UsbmuxDeviceManager connected stream for device %d", devID);
-                reevaluateAssignments();
-
-                dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^{
-                    readStreamLoop(cfd, devID);
-                });
+            dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^{
+              readStreamLoop(cfd, devID);
             });
+          });
         });
     }
 
     void readStreamLoop(int fd, int devID)
     {
-        std::vector<uint8_t> readBuf(65536);
+        std::vector<uint8_t> readBuf(256 * 1024);
         while (true) {
             const ssize_t n = recv(fd, readBuf.data(), readBuf.size(), 0);
+            if (n < 0 && errno == EINTR)
+                continue;
             if (n <= 0)
                 break;
-            std::vector<uint8_t> chunk(readBuf.begin(), readBuf.begin() + n);
+            auto chunk = std::make_shared<std::vector<uint8_t>>(readBuf.begin(), readBuf.begin() + n);
             dispatch_async(queue_, ^{
-                auto it = devices_.find(devID);
-                if (it == devices_.end() || it->second.streamFd != fd)
-                    return;
-                auto &dev = it->second;
-                dev.rxBuffer.insert(dev.rxBuffer.end(), chunk.begin(), chunk.end());
-
-                while (dev.rxBuffer.size() >= 4) {
-                    const uint32_t len = (static_cast<uint32_t>(dev.rxBuffer[0]) << 24) |
-                                         (static_cast<uint32_t>(dev.rxBuffer[1]) << 16) |
-                                         (static_cast<uint32_t>(dev.rxBuffer[2]) << 8) |
-                                         static_cast<uint32_t>(dev.rxBuffer[3]);
-                    if (len > 10 * 1024 * 1024) {
-                        dev.rxBuffer.clear();
-                        break;
-                    }
-                    const size_t totalLength = 4 + static_cast<size_t>(len);
-                    if (dev.rxBuffer.size() < totalLength)
-                        break;
-
-                    auto packetData = std::make_shared<std::vector<uint8_t>>(
-                        dev.rxBuffer.begin() + 4, dev.rxBuffer.begin() + totalLength);
-                    dev.rxBuffer.erase(dev.rxBuffer.begin(), dev.rxBuffer.begin() + totalLength);
-
-                    auto parsed = parsePacket(packetData->data(), packetData->size());
-                    if (parsed && parsed->kind == PacketKind::Hello) {
-                        auto hello = parseHelloPayload(parsed->payload);
-                        if (hello) {
-                            dev.deviceName = hello->deviceName;
-                            registerDiscoveredDevice(hello->deviceName);
-                            reevaluateAssignments();
-                        }
-                    }
-
-                    if (dev.owner) {
-                        dev.owner->dispatchPacket(packetData);
-                    }
-                }
+              auto it = devices_.find(devID);
+              if (it == devices_.end() || it->second.streamFd != fd)
+                  return;
+              auto &dev = it->second;
+              dev.framer.append(chunk->data(), chunk->size());
+              while (auto bytes = dev.framer.next()) {
+                  auto packetData = std::make_shared<std::vector<uint8_t>>(std::move(*bytes));
+                  auto parsed = parsePacket(packetData->data(), packetData->size());
+                  if (parsed && parsed->kind == PacketKind::Hello) {
+                      if (auto hello = parseHelloPayload(parsed->payload)) {
+                          dev.deviceName = hello->deviceName;
+                          registerDiscoveredDevice(hello->deviceName);
+                          reevaluateAssignments();
+                      }
+                  }
+                  if (dev.owner)
+                      dev.owner->dispatchPacket(packetData);
+              }
+              if (dev.framer.desynced()) {
+                  blog(LOG_WARNING, "[iPhoneCam] USB stream out of sync, reconnecting");
+                  shutdown(fd, SHUT_RDWR);
+              }
             });
         }
 
         dispatch_async(queue_, ^{
-            auto it = devices_.find(devID);
-            if (it != devices_.end() && it->second.streamFd == fd) {
-                close(fd);
-                it->second.streamFd = -1;
-                it->second.isConnecting = false;
-                it->second.rxBuffer.clear();
-                if (it->second.owner) {
-                    it->second.owner->onUsbDisconnected();
-                    it->second.owner = nullptr;
-                }
-                reevaluateAssignments();
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 1500 * NSEC_PER_MSEC), queue_, ^{
-                    auto ret = devices_.find(devID);
-                    if (ret != devices_.end() && ret->second.streamFd < 0 && !ret->second.isConnecting) {
-                        tryConnectDevice(devID);
-                    }
-                });
-            }
+          auto it = devices_.find(devID);
+          if (it == devices_.end() || it->second.streamFd != fd)
+              return;
+          close(fd);
+          it->second.streamFd = -1;
+          it->second.isConnecting = false;
+          it->second.framer.reset();
+          if (it->second.owner) {
+              it->second.owner->onUsbDisconnected();
+              it->second.owner = nullptr;
+          }
+          reevaluateAssignments();
+          retryConnectLater(devID);
         });
     }
 
     void reevaluateAssignments()
     {
-        // 1. Check existing owners
+        // 1. Release devices whose owner left or now wants a different iPhone.
         for (auto &pair : devices_) {
             auto &dev = pair.second;
-            if (dev.owner) {
-                auto it = std::find_if(receivers_.begin(), receivers_.end(),
-                                       [&dev](const RegisteredReceiver &r) { return r.impl == dev.owner; });
-                if (it == receivers_.end()) {
-                    dev.owner = nullptr;
-                } else if (!it->targetDevice.empty() && dev.deviceName != it->targetDevice) {
-                    dev.owner = nullptr;
-                    it->impl->onUsbDisconnected();
-                }
+            if (!dev.owner)
+                continue;
+            auto it = std::find_if(receivers_.begin(), receivers_.end(),
+                                   [&dev](const RegisteredReceiver &r) { return r.impl == dev.owner; });
+            if (it == receivers_.end()) {
+                dev.owner = nullptr;
+            } else if (!it->targetDevice.empty() && dev.deviceName != it->targetDevice) {
+                dev.owner = nullptr;
+                it->impl->onUsbDisconnected();
             }
         }
 
-        // 2. Assign exact target matches
+        // 2. Receivers pinned to a camera name.
         for (auto &r : receivers_) {
             if (isReceiverAssigned(r.impl) || r.targetDevice.empty())
                 continue;
@@ -798,7 +787,7 @@ private:
             }
         }
 
-        // 3. Assign wildcard / Auto receivers
+        // 3. Receivers that take the first free iPhone.
         for (auto &r : receivers_) {
             if (isReceiverAssigned(r.impl) || !r.targetDevice.empty())
                 continue;
@@ -820,158 +809,226 @@ private:
     std::vector<RegisteredReceiver> receivers_;
 };
 
-void NetworkReceiver::Impl::setTargetDevice(std::string target)
-{
-    dispatch_async(queue, ^{
-        if (targetDevice == target)
-            return;
-        targetDevice = std::move(target);
-        if (socketFd >= 0 && port > 0) {
-            publishBonjour(currentReceiverName, port, targetDevice);
-        }
-        if (isRunning) {
-            UsbmuxDeviceManager::instance().setReceiverTarget(this, targetDevice);
-        }
-    });
-}
+// MARK: - NetworkReceiver::Impl
 
-void NetworkReceiver::Impl::start(const std::string &receiverName)
+void NetworkReceiver::Impl::start(const ReceiverConfig &next)
 {
     stop();
+    config = next;
     isRunning = true;
-    currentReceiverName = receiverName;
 
-    int fd = socket(AF_INET6, SOCK_DGRAM, IPPROTO_UDP);
-    if (fd < 0) {
-        fail(errnoDescription("socket"));
+    if (config.mode == ConnectionMode::Usb) {
+        publishStatus(config.targetDevice.empty() ? "Waiting for an iPhone on USB"
+                                                  : "Waiting for " + config.targetDevice + " on USB",
+                      "", false);
+        UsbmuxDeviceManager::instance().registerReceiver(this, config.targetDevice);
         return;
     }
 
-    const int yes = 1;
-    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
-    const int receiveBufferSize = 4 * 1024 * 1024;
-    setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &receiveBufferSize, sizeof(receiveBufferSize));
-    const int no = 0;
-    setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &no, sizeof(no));
-
-    sockaddr_in6 address = {};
-    address.sin6_family = AF_INET6;
-    address.sin6_addr = in6addr_any;
-    address.sin6_port = 0;
-    if (bind(fd, reinterpret_cast<const sockaddr *>(&address), sizeof(address)) < 0) {
-        const std::string message = errnoDescription("bind");
-        close(fd);
-        fail(message);
-        return;
-    }
-
-    sockaddr_in6 boundAddress = {};
-    socklen_t boundLength = sizeof(boundAddress);
-    if (getsockname(fd, reinterpret_cast<sockaddr *>(&boundAddress), &boundLength) < 0) {
-        const std::string message = errnoDescription("getsockname");
-        close(fd);
-        fail(message);
-        return;
-    }
-
-    if (fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK) < 0) {
-        const std::string message = errnoDescription("fcntl");
-        close(fd);
-        fail(message);
-        return;
-    }
-
-    socketFd = fd;
-    port = ntohs(boundAddress.sin6_port);
-    if (!publishBonjour(receiverName, port, targetDevice)) {
-        close(socketFd);
-        socketFd = -1;
-        port = 0;
-        return;
-    }
-
-    const int sourceFd = socketFd;
-    readSource = dispatch_source_create(DISPATCH_SOURCE_TYPE_READ, static_cast<uintptr_t>(sourceFd), 0, queue);
-    dispatch_source_set_event_handler(readSource, ^{
-      receiveAvailable();
-    });
-    dispatch_source_set_cancel_handler(readSource, ^{
-      close(sourceFd);
-    });
-    dispatch_resume(readSource);
-    startTimeoutTimer();
-
-    blog(LOG_INFO, "[iPhoneCam] OBS UDP receiver listening as '%s' on port %u (target: '%s')",
-         receiverName.c_str(), port, targetDevice.c_str());
-    publishStatus("Waiting for iPhone", port);
-
-    UsbmuxDeviceManager::instance().registerReceiver(this, targetDevice);
+    wifiRunning = true;
+    const ReceiverConfig settings = config;
+    wifiThread = std::thread([this, settings] { wifiLoop(settings); });
 }
 
 void NetworkReceiver::Impl::stop()
 {
     isRunning = false;
     UsbmuxDeviceManager::instance().unregisterReceiver(this);
-    isUsbConnected = false;
-    usbDeviceID = -1;
-    usbDeviceName.clear();
-
-    if (timeoutSource) {
-        dispatch_source_cancel(timeoutSource);
-        timeoutSource = nullptr;
-    }
-    if (readSource) {
-        dispatch_source_cancel(readSource);
-        readSource = nullptr;
-        socketFd = -1;
-    } else if (socketFd >= 0) {
-        close(socketFd);
-        socketFd = -1;
-    }
-    if (bonjourService) {
-        DNSServiceRefDeallocate(bonjourService);
-        bonjourService = nullptr;
-    }
-
-    // Flush any pending blocks on receiver queue
-    dispatch_sync(queue, ^{});
-
-    port = 0;
-    activeEndpoint.clear();
-    connectedDeviceName.clear();
-    activeAddress = {};
-    activeAddressLength = 0;
-    lastPacketAt = {};
-}
-
-void NetworkReceiver::Impl::sendControlCommand(const ControlCommand &command)
-{
-    if (UsbmuxDeviceManager::instance().sendControlCommand(this, command)) {
-        return;
-    }
-
-    const ControlCommand commandCopy = command;
-    dispatch_async(queue, ^{
-        if (socketFd < 0 || activeEndpoint.empty() || activeAddressLength == 0) {
-            blog(LOG_WARNING, "[iPhoneCam] Cannot send control command before an iPhone endpoint is connected");
-            return;
-        }
-
-        CameraPacket packet;
-        packet.kind = PacketKind::Control;
-        packet.streamId = 1;
-        packet.payload = encodeControlPayload(commandCopy);
-        const auto encoded = encodePacket(packet);
-
-        const ssize_t sent =
-            sendto(socketFd, encoded.data(), encoded.size(), 0, reinterpret_cast<const sockaddr *>(&activeAddress),
-                   activeAddressLength);
-        if (sent < 0) {
-            blog(LOG_WARNING, "[iPhoneCam] Failed to send control command to %s: %s", activeEndpoint.c_str(),
-                 std::strerror(errno));
-        }
+    stopWifi();
+    dispatch_sync(queue, ^{
+      isUsbConnected = false;
+      usbDeviceName.clear();
     });
 }
+
+void NetworkReceiver::Impl::onUsbConnected(int, std::string name)
+{
+    dispatch_async(queue, ^{
+      if (!isRunning)
+          return;
+      isUsbConnected = true;
+      usbDeviceName = name;
+      publishStatus("Connected to " + usbDeviceName + " via USB cable", "USB: " + usbDeviceName, true);
+      sendFramed(framedIdentify(kTransportUSB));
+    });
+}
+
+void NetworkReceiver::Impl::onUsbDisconnected()
+{
+    dispatch_async(queue, ^{
+      if (!isRunning)
+          return;
+      isUsbConnected = false;
+      usbDeviceName.clear();
+      publishStatus("iPhone disconnected, waiting on USB", "", false);
+    });
+}
+
+void NetworkReceiver::Impl::sendFramed(const std::vector<uint8_t> &bytes)
+{
+    if (!isRunning)
+        return;
+    if (config.mode == ConnectionMode::Usb) {
+        UsbmuxDeviceManager::instance().sendFramed(this, bytes);
+        return;
+    }
+    std::lock_guard<std::mutex> lock(wifiMutex);
+    if (wifiFd >= 0)
+        sendAll(wifiFd, bytes);
+}
+
+void NetworkReceiver::Impl::wifiLoop(ReceiverConfig settings)
+{
+    pthread_setname_np("iphonecam-wifi");
+    while (wifiRunning) {
+        if (settings.host.empty()) {
+            publishStatus("Enter the iPhone's IP address (iPhoneCam shows it on screen)", "", false);
+            waitForRetry(kWaitForSettingsChange);
+            continue;
+        }
+
+        auto target = PhoneDiscovery::instance().lookup(settings.host);
+        if (!target)
+            target = parseHostPort(settings.host, kStreamPort);
+        if (!target) {
+            publishStatus("Invalid address: " + settings.host, "", false);
+            waitForRetry(kWaitForSettingsChange);
+            continue;
+        }
+
+        const std::string endpoint = target->host + ":" + std::to_string(target->port);
+        publishStatus("Connecting to " + settings.host + "...", "", false);
+        const int fd = dial(*target);
+        if (fd < 0) {
+            if (!wifiRunning)
+                break;
+            publishStatus("Cannot reach " + endpoint + " (is iPhoneCam open on the same network?)", "", false);
+            waitForRetry(kRetryDelay);
+            continue;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(wifiMutex);
+            wifiFd = fd;
+        }
+        blog(LOG_INFO, "[iPhoneCam] Connected to %s over Wi-Fi", endpoint.c_str());
+        publishStatus("Connected via Wi-Fi", "Wi-Fi: " + endpoint, true);
+        sendFramed(framedIdentify(kTransportWiFi));
+
+        readWifi(fd);
+
+        {
+            std::lock_guard<std::mutex> lock(wifiMutex);
+            wifiFd = -1;
+        }
+        close(fd);
+        if (wifiRunning) {
+            blog(LOG_INFO, "[iPhoneCam] Lost %s, reconnecting", endpoint.c_str());
+            publishStatus("Lost " + endpoint + ", reconnecting...", "", false);
+            waitForRetry(kRetryDelay);
+        }
+    }
+}
+
+int NetworkReceiver::Impl::dial(const HostPort &target)
+{
+    addrinfo hints = {};
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_protocol = IPPROTO_TCP;
+    addrinfo *results = nullptr;
+    const std::string port = std::to_string(target.port);
+    if (getaddrinfo(target.host.c_str(), port.c_str(), &hints, &results) != 0 || !results)
+        return -1;
+
+    int connected = -1;
+    for (addrinfo *ai = results; ai && wifiRunning && connected < 0; ai = ai->ai_next) {
+        const int fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+        if (fd < 0)
+            continue;
+        const int flags = fcntl(fd, F_GETFL, 0);
+        fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+        int result = connect(fd, ai->ai_addr, ai->ai_addrlen);
+        if (result < 0 && errno == EINPROGRESS) {
+            result = -1;
+            // Poll in short slices so stop() never waits for a full connect timeout.
+            const auto deadline = std::chrono::steady_clock::now() + kConnectTimeout;
+            while (wifiRunning && std::chrono::steady_clock::now() < deadline) {
+                pollfd descriptor = {fd, POLLOUT, 0};
+                const int ready = poll(&descriptor, 1, 100);
+                if (ready > 0) {
+                    int error = 0;
+                    socklen_t length = sizeof(error);
+                    getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &length);
+                    result = error == 0 ? 0 : -1;
+                    break;
+                }
+                if (ready < 0 && errno != EINTR)
+                    break;
+            }
+        }
+        if (result == 0) {
+            fcntl(fd, F_SETFL, flags);
+            configureStreamSocket(fd, true);
+            connected = fd;
+        } else {
+            close(fd);
+        }
+    }
+    freeaddrinfo(results);
+    return connected;
+}
+
+void NetworkReceiver::Impl::readWifi(int fd)
+{
+    PacketStreamFramer framer;
+    std::vector<uint8_t> buffer(256 * 1024);
+    auto lastData = std::chrono::steady_clock::now();
+    while (wifiRunning) {
+        pollfd descriptor = {fd, POLLIN, 0};
+        const int ready = poll(&descriptor, 1, 250);
+        if (ready < 0) {
+            if (errno == EINTR)
+                continue;
+            break;
+        }
+        if (ready == 0) {
+            if (std::chrono::steady_clock::now() - lastData > kIdleTimeout) {
+                blog(LOG_WARNING, "[iPhoneCam] No data from the iPhone for 6 s, reconnecting");
+                break;
+            }
+            continue;
+        }
+        const ssize_t n = recv(fd, buffer.data(), buffer.size(), 0);
+        if (n < 0 && errno == EINTR)
+            continue;
+        if (n <= 0)
+            break;
+        lastData = std::chrono::steady_clock::now();
+        framer.append(buffer.data(), size_t(n));
+        while (auto packet = framer.next())
+            dispatchPacket(std::make_shared<std::vector<uint8_t>>(std::move(*packet)));
+        if (framer.desynced()) {
+            blog(LOG_WARNING, "[iPhoneCam] Wi-Fi stream out of sync, reconnecting");
+            break;
+        }
+    }
+}
+
+void NetworkReceiver::Impl::stopWifi()
+{
+    wifiRunning = false;
+    {
+        std::lock_guard<std::mutex> lock(wifiMutex);
+        if (wifiFd >= 0)
+            shutdown(wifiFd, SHUT_RDWR);
+    }
+    wifiWake.notify_all();
+    if (wifiThread.joinable())
+        wifiThread.join();
+}
+
+// MARK: - NetworkReceiver
 
 NetworkReceiver::NetworkReceiver() : impl_(new Impl()) {}
 
@@ -990,14 +1047,9 @@ void NetworkReceiver::setStatusCallback(StatusCallback callback)
     impl_->onStatus = std::move(callback);
 }
 
-void NetworkReceiver::setTargetDevice(const std::string &targetDevice)
+void NetworkReceiver::start(const ReceiverConfig &config)
 {
-    impl_->setTargetDevice(targetDevice);
-}
-
-void NetworkReceiver::start(const std::string &receiverName)
-{
-    impl_->start(receiverName);
+    impl_->start(config);
 }
 
 void NetworkReceiver::stop()
@@ -1007,7 +1059,20 @@ void NetworkReceiver::stop()
 
 void NetworkReceiver::sendControlCommand(const ControlCommand &command)
 {
-    impl_->sendControlCommand(command);
+    const auto bytes = framedControl(command);
+    Impl *impl = impl_;
+    dispatch_async(impl->queue, ^{
+      impl->sendFramed(bytes);
+    });
+}
+
+void NetworkReceiver::sendPacket(const CameraPacket &packet)
+{
+    const auto bytes = encodeFramedPacket(packet);
+    Impl *impl = impl_;
+    dispatch_async(impl->queue, ^{
+      impl->sendFramed(bytes);
+    });
 }
 
 } // namespace iphonecam

@@ -1,6 +1,8 @@
 #include "frame_reassembler.hpp"
 #include "protocol.hpp"
+#include "stream_support.hpp"
 
+#include <algorithm>
 #include <cassert>
 #include <chrono>
 #include <iostream>
@@ -180,6 +182,120 @@ void testAudioPacketRoundTrip()
     assert(parsed->payload == packet.payload);
 }
 
+void testIdentifyPayloadEscapesNames()
+{
+    ControlCommand command;
+    command.action = ControlAction::Identify;
+    command.transport = kTransportWiFi;
+    command.clientName = "OBS on \"Studio\" Mac";
+
+    const auto payload = encodeControlPayload(command);
+    const std::string json(payload.begin(), payload.end());
+    assert(json == R"({"action":"identify","transport":"wifi","clientName":"OBS on \"Studio\" Mac"})");
+}
+
+void testNewPacketKindsParse()
+{
+    for (const auto kind : {PacketKind::Ping, PacketKind::TimeSyncRequest, PacketKind::TimeSyncResponse}) {
+        CameraPacket packet;
+        packet.kind = kind;
+        packet.streamId = 1;
+        packet.ptsNanos = 42;
+        const auto encoded = encodePacket(packet);
+        const auto parsed = parsePacket(encoded.data(), encoded.size());
+        assert(parsed.has_value());
+        assert(parsed->kind == kind);
+        assert(parsed->ptsNanos == 42);
+    }
+
+    CameraPacket unknown;
+    auto encoded = encodePacket(unknown);
+    encoded[5] = 9;
+    assert(!parsePacket(encoded.data(), encoded.size()).has_value());
+}
+
+void testStreamFramerSplitsAndJoinsChunks()
+{
+    CameraPacket first;
+    first.kind = PacketKind::Hello;
+    first.streamId = 1;
+    first.payload = {1, 2, 3};
+    CameraPacket second;
+    second.kind = PacketKind::FrameFragment;
+    second.streamId = 1;
+    second.frameId = 9;
+    second.payload = std::vector<uint8_t>(5000, 0x7f);
+
+    std::vector<uint8_t> stream = encodeFramedPacket(first);
+    const auto secondFramed = encodeFramedPacket(second);
+    stream.insert(stream.end(), secondFramed.begin(), secondFramed.end());
+
+    PacketStreamFramer framer;
+    std::vector<CameraPacket> parsed;
+    // Feed in uneven chunks, as TCP delivers them.
+    for (size_t offset = 0; offset < stream.size(); offset += 777) {
+        const size_t size = std::min<size_t>(777, stream.size() - offset);
+        framer.append(stream.data() + offset, size);
+        while (auto bytes = framer.next()) {
+            auto packet = parsePacket(bytes->data(), bytes->size());
+            assert(packet.has_value());
+            parsed.push_back(*packet);
+        }
+    }
+    assert(parsed.size() == 2);
+    assert(parsed[0].kind == PacketKind::Hello);
+    assert(parsed[0].payload == first.payload);
+    assert(parsed[1].frameId == 9);
+    assert(parsed[1].payload == second.payload);
+    assert(!framer.desynced());
+}
+
+void testStreamFramerFlagsGarbageLength()
+{
+    PacketStreamFramer framer;
+    const uint8_t garbage[] = {0xff, 0xff, 0xff, 0xff, 0, 0};
+    framer.append(garbage, sizeof(garbage));
+    assert(!framer.next().has_value());
+    assert(framer.desynced());
+}
+
+void testParseHostPort()
+{
+    auto plain = parseHostPort(" 192.168.1.5 ", kStreamPort);
+    assert(plain && plain->host == "192.168.1.5" && plain->port == kStreamPort);
+    auto withPort = parseHostPort("192.168.1.5:9000", kStreamPort);
+    assert(withPort && withPort->host == "192.168.1.5" && withPort->port == 9000);
+    auto bracketed = parseHostPort("[fe80::1]:9001", kStreamPort);
+    assert(bracketed && bracketed->host == "fe80::1" && bracketed->port == 9001);
+    auto bareV6 = parseHostPort("fe80::1", kStreamPort);
+    assert(bareV6 && bareV6->host == "fe80::1" && bareV6->port == kStreamPort);
+    auto name = parseHostPort("Alper's iPhone", kStreamPort);
+    assert(name && name->host == "Alper's iPhone");
+    assert(!parseHostPort("", kStreamPort));
+    assert(!parseHostPort("10.0.0.1:99999", kStreamPort));
+    assert(!parseHostPort("10.0.0.1:abc", kStreamPort));
+}
+
+void testClockOffsetUsesLowestRoundTrip()
+{
+    ClockOffsetEstimator clock;
+    assert(!clock.ready());
+    // Phone clock runs 5 s ahead. A slow round trip (40 ms) whose reply came back late skews its midpoint,
+    // so the 2 ms sample must win.
+    clock.addSample(1'000'000'000ULL, 6'000'000'000ULL + 30'000'000ULL, 1'040'000'000ULL);
+    clock.addSample(2'000'000'000ULL, 7'001'000'000ULL, 2'002'000'000ULL);
+    assert(clock.ready());
+    assert(clock.rttNs() == 2'000'000ULL);
+    assert(clock.offsetNs() == 5'000'000'000LL);
+    const auto local = clock.toLocal(7'500'000'000ULL);
+    assert(local && *local == 2'500'000'000ULL);
+
+    std::vector<uint8_t> echo = {0, 0, 0, 0, 0x3b, 0x9a, 0xca, 0x00};
+    assert(readTimeSyncEcho(echo) == 1'000'000'000ULL);
+    echo.pop_back();
+    assert(!readTimeSyncEcho(echo).has_value());
+}
+
 } // namespace
 
 int main()
@@ -192,6 +308,12 @@ int main()
     testFrameReassembly();
     testStaleDrop();
     testJsonPayloads();
+    testIdentifyPayloadEscapesNames();
+    testNewPacketKindsParse();
+    testStreamFramerSplitsAndJoinsChunks();
+    testStreamFramerFlagsGarbageLength();
+    testParseHostPort();
+    testClockOffsetUsesLowestRoundTrip();
     std::cout << "iphonecam OBS protocol tests passed\n";
     return 0;
 }

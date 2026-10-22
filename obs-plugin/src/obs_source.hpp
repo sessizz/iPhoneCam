@@ -4,6 +4,7 @@
 #include "frame_reassembler.hpp"
 #include "network_receiver.hpp"
 #include "protocol.hpp"
+#include "stream_support.hpp"
 #include "video_decoder.hpp"
 
 #include <atomic>
@@ -24,7 +25,8 @@ typedef struct obs_source obs_source_t;
 namespace iphonecam {
 
 struct SourceSettings {
-    std::string receiverName = "iPhoneCam OBS";
+    ConnectionMode mode = ConnectionMode::Usb;
+    std::string host = "";
     std::string targetDevice = "";
     int latencyMs = 0;
     bool audioEnabled = true;
@@ -36,7 +38,11 @@ struct SourceStats {
     std::string targetDevice = "Auto";
     std::string deviceName = "-";
     std::string format = "No stream";
-    std::string udpPort = "-";
+    std::string connection = "-";
+    bool connected = false;
+    // Capture on the iPhone to decoded here, from the clock offset; negative until measured.
+    double latencyMs = -1;
+    double clockRttMs = -1;
     int receivedFrames = 0;
     int displayedFrames = 0;
     int networkDroppedFrames = 0;
@@ -68,7 +74,11 @@ private:
     void unregisterHotkeys();
     void sendControlCommand(const ControlCommand &command);
     void requestKeyFrame();
-    void handleDatagram(const std::vector<uint8_t> &data);
+    void handlePacket(const std::vector<uint8_t> &data);
+    void handleConnectionStatus(const std::string &status, const std::string &connection, bool connected);
+    void sendTimeSyncRequest();
+    void handleTimeSyncResponse(const CameraPacket &packet);
+    void noteFrameLatency(uint64_t ptsNanos);
     void handleHello(const HelloPayload &hello);
     void handleFormat(const FormatPayload &format);
     void handleFrame(const EncodedVideoFrame &frame);
@@ -101,6 +111,11 @@ private:
     std::chrono::steady_clock::time_point lastFrameAt_;
     std::chrono::steady_clock::time_point lastStatsAt_;
     std::chrono::steady_clock::time_point lastKeyFrameRequestAt_{};
+    std::chrono::steady_clock::time_point lastTimeSyncAt_{};
+    std::atomic<bool> connected_ = false;
+    std::mutex clockMutex_;
+    ClockOffsetEstimator clock_;
+    double latencyAverageMs_ = -1;
     std::atomic<bool> statsDirty_ = true;
     std::atomic<int> pendingDecodeFrames_ = 0;
     std::atomic<uint64_t> decodeGeneration_ = 0;
